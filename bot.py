@@ -25,6 +25,7 @@ user_temp = {}
 # ================= GAME HANDS =================
 
 LEFT_HANDS = [
+    "❌ لا شيء",
     "♠️ متتالية من نفس النوع",
     "👥 زوج",
     "🅰️ AA"
@@ -172,37 +173,7 @@ async def stats(message: Message):
         users = await conn.fetchval("SELECT COUNT(*) FROM users")
         training = await conn.fetchval("SELECT COUNT(*) FROM training")
 
-    await message.answer(
-        f"👥 المشتركين: {users}\n🧠 بيانات التدريب: {training}"
-    )
-
-
-# ================= USE CODE =================
-
-@dp.message(Command("code"))
-async def use_code(message: Message):
-    parts = message.text.split()
-    if len(parts) != 2:
-        await message.answer("استخدم:\n/code XXXXX")
-        return
-
-    code = parts[1].upper()
-
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT days, plan FROM codes WHERE code=$1 AND used=FALSE",
-            code
-        )
-
-        if not row:
-            await message.answer("❌ كود غير صالح")
-            return
-
-        await conn.execute("UPDATE codes SET used=TRUE WHERE code=$1", code)
-
-    await activate_user(message.from_user.id, row["days"], row["plan"])
-    await message.answer("🔥 تم التفعيل")
-
+    await message.answer(f"👥 المشتركين: {users}\n🧠 بيانات التدريب: {training}")
 
 # ================= AI =================
 
@@ -226,7 +197,6 @@ async def predict_hand(side, rank, suit, prev, hands_list):
 
     for r in rows:
         weight = 0
-
         if r["rank"] == rank:
             weight += 3
         if r["suit"] == suit:
@@ -234,9 +204,12 @@ async def predict_hand(side, rank, suit, prev, hands_list):
         if r["prev"] == prev:
             weight += 5
 
-        if weight > 0 and r["result"] in scores:
-            scores[r["result"]] += weight
-            total += weight
+        if weight > 0:
+            results = r["result"].split(",")
+            for res in results:
+                if res in scores:
+                    scores[res] += weight
+                    total += weight
 
     if total == 0:
         return "لا يوجد بيانات", 0
@@ -245,7 +218,6 @@ async def predict_hand(side, rank, suit, prev, hands_list):
     confidence = int((scores[best] / total) * 100)
 
     return best, confidence
-
 
 # ================= KEYBOARDS =================
 
@@ -276,6 +248,28 @@ def hands_kb(prefix, hands_list):
             for h in hands_list
         ]
     )
+
+
+def left_training_kb(selected=None):
+    if selected is None:
+        selected = []
+
+    keyboard = []
+
+    for h in LEFT_HANDS:
+        mark = "✅ " if h in selected else ""
+        keyboard.append([
+            InlineKeyboardButton(
+                text=f"{mark}{h}",
+                callback_data=f"toggle_left_{h}"
+            )
+        ])
+
+    keyboard.append([
+        InlineKeyboardButton(text="✔️ تم", callback_data="confirm_left")
+    ])
+
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 # ================= GAME FLOW =================
 
@@ -327,11 +321,13 @@ async def handle_prev(callback: CallbackQuery):
 
     if user_id == ADMIN_ID:
         user_temp[user_id]["prev"] = prev
+        user_temp[user_id]["left_selected"] = []
+
         await callback.message.edit_text(
             f"⬅️ يسار: {left_pred} ({left_conf}%)\n"
             f"➡️ يمين: {right_pred} ({right_conf}%)\n\n"
-            f"ادخل نتيجة اليسار:",
-            reply_markup=hands_kb("train_left", LEFT_HANDS)
+            f"اختر نتائج اليسار:",
+            reply_markup=left_training_kb([])
         )
     else:
         await callback.message.edit_text(
@@ -340,13 +336,47 @@ async def handle_prev(callback: CallbackQuery):
         )
 
 
-@dp.callback_query(lambda c: c.data.startswith("train_left_"))
-async def train_left(callback: CallbackQuery):
+@dp.callback_query(lambda c: c.data.startswith("toggle_left_"))
+async def toggle_left(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         return
+
     await callback.answer()
 
-    user_temp[ADMIN_ID]["left"] = callback.data.replace("train_left_", "")
+    hand = callback.data.replace("toggle_left_", "")
+    selected = user_temp[ADMIN_ID].get("left_selected", [])
+
+    if hand in selected:
+        selected.remove(hand)
+    else:
+        if hand == "❌ لا شيء":
+            selected = ["❌ لا شيء"]
+        else:
+            selected = [h for h in selected if h != "❌ لا شيء"]
+            selected.append(hand)
+
+    user_temp[ADMIN_ID]["left_selected"] = selected
+
+    await callback.message.edit_reply_markup(
+        reply_markup=left_training_kb(selected)
+    )
+
+
+@dp.callback_query(lambda c: c.data == "confirm_left")
+async def confirm_left(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return
+
+    await callback.answer()
+
+    selected = user_temp[ADMIN_ID].get("left_selected", [])
+
+    if not selected:
+        await callback.answer("اختر نتيجة أولاً", show_alert=True)
+        return
+
+    user_temp[ADMIN_ID]["left"] = ",".join(selected)
+
     await callback.message.edit_text(
         "ادخل نتيجة اليمين:",
         reply_markup=hands_kb("train_right", RIGHT_HANDS)
@@ -357,6 +387,7 @@ async def train_left(callback: CallbackQuery):
 async def train_right(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         return
+
     await callback.answer()
 
     right = callback.data.replace("train_right_", "")
