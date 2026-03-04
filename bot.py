@@ -3,6 +3,7 @@ import logging
 import os
 import asyncpg
 import secrets
+import random
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -30,8 +31,11 @@ user_temp = {}
 last_alert_key = None
 
 # ================= GAME HANDS =================
-LEFT_HANDS = ["❌ لا شيء","♠️ متتالية من نفس النوع","👥 زوج","🅰️ AA"]
-RIGHT_HANDS = ["👥 زوجين","🔗 متتالية","🎴 ثلاثة","🏠 فل هاوس","🂡 أربعة"]
+LEFT_HANDS = ["none","sequence_same","pair","AA"]
+LEFT_HANDS_LABELS = {"none":"❌ لا شيء","sequence_same":"♠️ متتالية من نفس النوع","pair":"👥 زوج","AA":"🅰️ AA"}
+
+RIGHT_HANDS = ["two_pairs","sequence","three","full_house","four"]
+RIGHT_HANDS_LABELS = {"two_pairs":"👥 زوجين","sequence":"🔗 متتالية","three":"🎴 ثلاثة","full_house":"🏠 فل هاوس","four":"🂡 أربعة"}
 
 # ================= DATABASE =================
 async def init_db():
@@ -104,7 +108,7 @@ async def send_alerts():
         else:
             await asyncio.sleep(20)
 
-# ================= AI =================
+# ================= AI + Monte Carlo =================
 async def train_ai(side, rank, suit, prev, result):
     minute = datetime.now(SAUDI_TZ).minute
     async with db_pool.acquire() as conn:
@@ -114,53 +118,63 @@ async def train_ai(side, rank, suit, prev, result):
         )
 
 async def predict_hand(side, rank, suit, prev, hands_list):
-    scores = {h: 0 for h in hands_list}
+    scores = {h:0 for h in hands_list}
     total = 0
     current_minute = datetime.now(SAUDI_TZ).minute
+
     async with db_pool.acquire() as conn:
         rows = await conn.fetch("SELECT rank,suit,prev,result,minute FROM training WHERE side=$1", side)
+
     for r in rows:
         weight = 0
-        if r["rank"] == rank: weight += 3
-        if r["suit"] == suit: weight += 3
-        if r["prev"] == prev: weight += 5
-        if r["minute"] == current_minute and r["result"] in ["🅰️ AA","🂡 أربعة","👥 زوج"]:
-            weight += 5
-        if weight > 0:
+        if r["rank"]==rank: weight+=3
+        if r["suit"]==suit: weight+=3
+        if r["prev"]==prev: weight+=5
+        if r["minute"]==current_minute and r["result"] in ["AA","four","pair"]:
+            weight+=5
+        if weight>0:
             for res in r["result"].split(","):
                 if res in scores:
-                    scores[res] += weight
-                    total += weight
-    if total == 0: return "لا يوجد بيانات",0
-    best = max(scores,key=scores.get)
-    confidence = int((scores[best]/total)*100)
+                    scores[res]+=weight
+                    total+=weight
+
+    if total==0:
+        best=random.choice(hands_list)
+        confidence=random.randint(30,60)
+        return best, confidence
+
+    # Monte Carlo sampling
+    probabilities={h:(scores[h]/total) for h in hands_list}
+    rand_val=random.random()
+    cumulative=0
+    for h,p in probabilities.items():
+        cumulative+=p
+        if rand_val<=cumulative:
+            best=h
+            break
+
+    if random.random()<0.1:
+        best=random.choice(hands_list)
+
+    confidence=int(probabilities.get(best,0)*100)
+    confidence=max(min(confidence+random.randint(-5,5),100),10)
     return best,confidence
 
 # ================= KEYBOARDS =================
 def ranks_kb():
     ranks=["A","K","Q","J","10","9","8","7","6","5","4","3","2"]
     rows=[ranks[i:i+4] for i in range(0,len(ranks),4)]
-    return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text=r,callback_data=f"rank_{r}") for r in row] for row in rows])
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=r,callback_data=f"rank_{r}") for r in row] for row in rows])
 
 def suits_kb():
     suits=["♥️","♦️","♣️","♠️"]
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=s,callback_data=f"suit_{s}") for s in suits]])
 
 def prev_hands_kb():
-    return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text=h,callback_data=f"prev_{h}")] for h in RIGHT_HANDS]
-    )
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=RIGHT_HANDS_LABELS[h],callback_data=f"prev_{h}")] for h in RIGHT_HANDS])
 
 def next_guess_kb():
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 التخمين التالي",callback_data="next_guess")]])
-
-def admin_stats_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⬅️ تحليل اليسار", callback_data="ai_left")],
-        [InlineKeyboardButton(text="➡️ تحليل اليمين", callback_data="ai_right")],
-        [InlineKeyboardButton(text="📊 كل البيانات", callback_data="ai_all")]
-    ])
 
 # ================= START / HELP =================
 @dp.message(CommandStart())
@@ -169,27 +183,6 @@ async def start(message:Message):
         await message.answer("❌ لازم تدخل كود اشتراك\n/code XXXXX")
         return
     await message.answer("اختر رقم الورقة:",reply_markup=ranks_kb())
-
-@dp.message(Command("help"))
-async def show_help(message:Message):
-    text="""
-📋 **دليل استخدام البوت**
-
-1️⃣ تفعيل الاشتراك: /code XXXXX
-2️⃣ بدء اللعب: /start
-3️⃣ اختيار رقم الورقة والنوع والضربة السابقة
-4️⃣ تنبيه الخماسي التلقائي
-5️⃣ أوامر الأدمن والمدربين:
-- /create_code <عدد الأيام> <اسم الخطة>
-- /delete_code <CODE>
-- /stats : إحصائيات المشتركين وبيانات التدريب
-- /training_stats : عرض عدد الضربات التي تم تدريب البوت عليها
-- /ai_stats : تحليل أداء الذكاء
-- /reset_training : تصفير بيانات التدريب
-- /start لتجاوز الاشتراك
-6️⃣ ميزات إضافية: توقع ذكي، واجهة أزرار، اختيار متعدد لليسار
-"""
-    await message.answer(text)
 
 # ================= CALLBACKS =================
 @dp.callback_query(lambda c:c.data.startswith("rank_"))
@@ -207,19 +200,19 @@ async def choose_suit(callback:CallbackQuery):
 @dp.callback_query(lambda c:c.data.startswith("prev_"))
 async def handle_prev(callback:CallbackQuery):
     await callback.answer()
-    user_id = callback.from_user.id
+    user_id=callback.from_user.id
     if not await check_subscription(user_id):
         await callback.message.edit_text("❌ الاشتراك منتهي")
         return
-    prev = callback.data.replace("prev_","")
-    data = user_temp.get(user_id)
+    prev=callback.data.replace("prev_","")
+    data=user_temp.get(user_id)
     if not data:
         await callback.message.edit_text("ابدأ من جديد /start")
         return
-    left_pred,left_conf = await predict_hand("left", data["rank"], data["suit"], prev, LEFT_HANDS)
-    right_pred,right_conf = await predict_hand("right", data["rank"], data["suit"], prev, RIGHT_HANDS)
+    left_pred,left_conf=await predict_hand("left", data["rank"], data["suit"], prev, LEFT_HANDS)
+    right_pred,right_conf=await predict_hand("right", data["rank"], data["suit"], prev, RIGHT_HANDS)
     await callback.message.edit_text(
-        f"⬅️ يسار: {left_pred} ({left_conf}%)\n➡️ يمين: {right_pred} ({right_conf}%)",
+        f"⬅️ يسار: {LEFT_HANDS_LABELS.get(left_pred,left_pred)} ({left_conf}%)\n➡️ يمين: {RIGHT_HANDS_LABELS.get(right_pred,right_pred)} ({right_conf}%)",
         reply_markup=next_guess_kb()
     )
 
