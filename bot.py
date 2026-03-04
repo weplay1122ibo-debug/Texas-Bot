@@ -1,299 +1,268 @@
-import asyncio
-import logging
-import os
-import random
+import asyncio, os, asyncpg, secrets, random
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from collections import Counter
 
-import asyncpg
-from aiogram import Bot, Dispatcher, F
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
-from aiogram.filters import Command, CommandStart
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram import Bot, Dispatcher
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+from aiogram.filters import CommandStart, Command
 from aiohttp import web
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 # ================= CONFIG =================
 API_TOKEN = os.environ["BOT_TOKEN"]
 DATABASE_URL = os.environ["DATABASE_URL"]
 WEBHOOK_PATH = "/webhook"
 ADMIN_ID = 7717061636
-WEBHOOK_URL = os.environ["WEBHOOK_URL"]
+TRAINER_IDS = []
 
 SAUDI_TZ = ZoneInfo("Asia/Riyadh")
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-
-# ================= BOT =================
-bot = Bot(
-    token=API_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
-)
-dp = Dispatcher(storage=MemoryStorage())
-
-# ================= STATES =================
-class GameStates(StatesGroup):
-    waiting_rank = State()
-    waiting_suit = State()
-    waiting_prev = State()
-
-class RecordStates(StatesGroup):
-    waiting_actual_left = State()
-    waiting_actual_right = State()
-
-# ================= HANDS =================
-LEFT_HANDS = ["none", "sequence_same", "pair", "AA"]
-RIGHT_HANDS = ["two_pairs", "sequence", "three", "full_house", "four"]
-
-LEFT_LABELS = {"none":"❌ لا شيء", "sequence_same":"♠️ متتالية نفس", "pair":"👥 زوج", "AA":"🅰️ AA"}
-RIGHT_LABELS = {"two_pairs":"👥 زوجين", "sequence":"🔗 متتالية", "three":"🎴 ثلاثة", 
-                "full_house":"🏠 فل هاوس", "four":"🂡 أربعة"}
-
-# ================= DB =================
+bot = Bot(token=API_TOKEN)
+dp = Dispatcher()
 db_pool = None
+user_temp = {}
 
+# ================= GAME HANDS =================
+LEFT_HANDS = ["none","sequence_same","pair","AA"]
+LEFT_HANDS_LABELS = {"none":"❌ لا شيء","sequence_same":"♠️ متتالية من نفس النوع","pair":"👥 زوج","AA":"🅰️ AA"}
+
+RIGHT_HANDS = ["two_pairs","sequence","three","full_house","four"]
+RIGHT_HANDS_LABELS = {"two_pairs":"👥 زوجين","sequence":"🔗 متتالية","three":"🎴 ثلاثة","full_house":"🏠 فل هاوس","four":"🂡 أربعة"}
+
+# ================= DATABASE =================
 async def init_db():
     global db_pool
     db_pool = await asyncpg.create_pool(DATABASE_URL, ssl="require")
     async with db_pool.acquire() as conn:
         await conn.execute("""
-            CREATE TABLE IF NOT EXISTS training (
-                id SERIAL PRIMARY KEY,
-                side TEXT NOT NULL,
-                rank TEXT,
-                suit TEXT,
-                prev TEXT,
-                result TEXT,
-                minute INT,
-                created_at TIMESTAMP DEFAULT NOW()
-            );
-            CREATE INDEX IF NOT EXISTS idx_side ON training(side);
-            CREATE INDEX IF NOT EXISTS idx_date ON training(created_at DESC);
+        CREATE TABLE IF NOT EXISTS training (
+            id SERIAL PRIMARY KEY,
+            side TEXT,
+            rank TEXT,
+            suit TEXT,
+            prev TEXT,
+            result TEXT,
+            minute INT,
+            created_at TIMESTAMP DEFAULT NOW()
+        )
         """)
         await conn.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id TEXT PRIMARY KEY,
-                expire TIMESTAMP,
-                plan TEXT,
-                is_trainer BOOLEAN DEFAULT FALSE
-            );
+        CREATE TABLE IF NOT EXISTS users (
+            user_id TEXT PRIMARY KEY,
+            expire TIMESTAMP,
+            plan TEXT
+        )
         """)
         await conn.execute("""
-            CREATE TABLE IF NOT EXISTS codes (
-                code TEXT PRIMARY KEY,
-                days INTEGER,
-                plan TEXT,
-                used BOOLEAN DEFAULT FALSE,
-                type TEXT DEFAULT 'user'
-            );
+        CREATE TABLE IF NOT EXISTS codes (
+            code TEXT PRIMARY KEY,
+            days INTEGER,
+            plan TEXT,
+            used BOOLEAN DEFAULT FALSE,
+            type TEXT DEFAULT 'user'
+        )
         """)
 
-async def is_trainer(user_id: int) -> bool:
-    if user_id == ADMIN_ID:
+# ================= SUBSCRIPTION =================
+async def check_subscription(user_id):
+    if user_id == ADMIN_ID or user_id in TRAINER_IDS:
         return True
     async with db_pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT is_trainer FROM users WHERE user_id = $1", str(user_id))
-        return bool(row and row["is_trainer"])
+        row = await conn.fetchrow("SELECT expire FROM users WHERE user_id=$1", str(user_id))
+    return row and row["expire"] > datetime.now()
+
+async def activate_user(user_id, days, plan, type="user"):
+    async with db_pool.acquire() as conn:
+        expire = datetime.now() + timedelta(days=days)
+        await conn.execute("""
+        INSERT INTO users (user_id, expire, plan)
+        VALUES ($1,$2,$3)
+        ON CONFLICT (user_id)
+        DO UPDATE SET expire=$2, plan=$3
+        """, str(user_id), expire, plan)
+        if type=="trainer":
+            TRAINER_IDS.append(user_id)
 
 # ================= AI =================
-async def train_ai(side: str, rank: str, suit: str, prev: str, result: str):
+async def train_ai(side, rank, suit, prev, result):
     minute = datetime.now(SAUDI_TZ).minute
     async with db_pool.acquire() as conn:
         await conn.execute(
-            "INSERT INTO training (side,rank,suit,prev,result,minute) VALUES ($1,$2,$3,$4,$5,$6)",
+            "INSERT INTO training (side, rank, suit, prev, result, minute) VALUES ($1,$2,$3,$4,$5,$6)",
             side, rank, suit, prev, result, minute
         )
-    # تنظيف تلقائي كل 90 يوم
+
+async def predict_hand(side, rank, suit, prev, hands_list):
+    scores = {h:0 for h in hands_list}
+    total = 0
+    current_minute = datetime.now(SAUDI_TZ).minute
+
     async with db_pool.acquire() as conn:
-        await conn.execute("DELETE FROM training WHERE created_at < NOW() - INTERVAL '90 days'")
+        rows = await conn.fetch("SELECT rank,suit,prev,result,minute FROM training WHERE side=$1", side)
 
-async def predict_hand(side: str, rank: str, suit: str, prev: str, hands_list: list):
-    current_min = datetime.now(SAUDI_TZ).minute
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch("""
-            SELECT result, minute, created_at 
-            FROM training 
-            WHERE side = $1 AND created_at > NOW() - INTERVAL '90 days'
-            LIMIT 8000
-        """, side)
+    for r in rows:
+        weight = 0
+        if r["rank"]==rank: weight+=3
+        if r["suit"]==suit: weight+=3
+        if r["prev"]==prev: weight+=5
+        if r["minute"]==current_minute and r["result"] in ["AA","four","pair"]:
+            weight+=5
+        if weight>0:
+            for res in r["result"].split(","):
+                if res in scores:
+                    scores[res]+=weight
+                    total+=weight
 
-    scores = {h: 1.0 for h in hands_list}  # Laplace
-    total = len(hands_list)
+    if total==0:
+        best=random.choice(hands_list)
+        confidence=random.randint(30,60)
+        return best, confidence
 
-    for row in rows:
-        w = 1.0
-        if row["minute"] == current_min: w += 4.0
-        age = (datetime.now(SAUDI_TZ) - row["created_at"]).days
-        w *= max(0.35, 1.0 - age * 0.009)
-        scores[row["result"]] += w
-        total += w
-
-    # Monte Carlo
-    samples = random.choices(list(scores.keys()), weights=list(scores.values()), k=30)
-    best = Counter(samples).most_common(1)[0][0]
-    conf = int((scores[best] / total) * 100)
-    conf = max(min(conf + random.randint(-7, 7), 97), 25)
-
-    return best, conf
+    probabilities={h:(scores[h]/total) for h in hands_list}
+    rand_val=random.random()
+    cumulative=0
+    for h,p in probabilities.items():
+        cumulative+=p
+        if rand_val<=cumulative:
+            best=h
+            break
+    if random.random()<0.1:
+        best=random.choice(hands_list)
+    confidence=int(probabilities.get(best,0)*100)
+    confidence=max(min(confidence+random.randint(-5,5),100),10)
+    return best,confidence
 
 # ================= KEYBOARDS =================
 def ranks_kb():
-    ranks = ["A","K","Q","J","10","9","8","7","6","5","4","3","2"]
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=r, callback_data=f"rank_{r}") for r in row]
-        for row in [ranks[i:i+4] for i in range(0, len(ranks), 4)]
-    ])
-
+    ranks=["A","K","Q","J","10","9","8","7","6","5","4","3","2"]
+    rows=[ranks[i:i+4] for i in range(0,len(ranks),4)]
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text=r,callback_data=f"rank_{r}") for r in row] for row in rows]
+    )
 def suits_kb():
-    suits = ["♥️","♦️","♣️","♠️"]
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=s, callback_data=f"suit_{s}") for s in suits]
-    ])
+    suits=["♥️","♦️","♣️","♠️"]
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text=s,callback_data=f"suit_{s}") for s in suits]]
+    )
+def prev_hands_kb():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text=RIGHT_HANDS_LABELS[h],callback_data=f"prev_{h}")] for h in RIGHT_HANDS]
+    )
+def next_guess_kb():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="🔄 التخمين التالي",callback_data="next_guess")]]
+    )
 
-def prev_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=RIGHT_LABELS[h], callback_data=f"prev_{h}")] for h in RIGHT_HANDS
-    ])
-
-def after_prediction_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 التخمين التالي", callback_data="next")],
-        [InlineKeyboardButton(text="📝 سجل النتيجة الفعلية", callback_data="record_result")]
-    ])
-
-def left_actual_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=LEFT_LABELS[h], callback_data=f"act_left_{h}")] for h in LEFT_HANDS
-    ])
-
-def right_actual_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=RIGHT_LABELS[h], callback_data=f"act_right_{h}")] for h in RIGHT_HANDS
-    ])
-
-# ================= HANDLERS =================
+# ================= START =================
 @dp.message(CommandStart())
-async def start(message: Message, state: FSMContext):
-    if not await is_trainer(message.from_user.id) and not await check_subscription(message.from_user.id):
-        return await message.answer("❌ لازم كود اشتراك\n/code XXXXX")
-    await state.set_state(GameStates.waiting_rank)
-    await message.answer("🎲 اختر رقم الورقة:", reply_markup=ranks_kb())
+async def start(message: Message):
+    if not await check_subscription(message.from_user.id):
+        await message.answer("❌ لازم تدخل كود اشتراك\n/code XXXXX")
+        return
+    mode = user_temp.get(message.from_user.id, {}).get("mode","guess_only")
+    await message.answer(
+        "🧠 وضع التدريب مفعل" if mode=="training" else "🎲 التخمين العادي",
+        reply_markup=ranks_kb()
+    )
 
-async def check_subscription(user_id: int) -> bool:
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT expire FROM users WHERE user_id=$1", str(user_id))
-        return bool(row and row["expire"] > datetime.now())
-
+# ================= USE CODE =================
 @dp.message(Command("code"))
 async def use_code(message: Message):
-    # ... (نفس الكود السابق بدون تغيير)
-    pass  # اكملها بنفس الطريقة السابقة إذا تبي، أو أضفها من الكود القديم
-
-@dp.message(Command("createcode"))
-async def create_code(message: Message):
-    if not await is_trainer(message.from_user.id): return
-    # ... (نفس السابق)
-
-@dp.callback_query(F.data.startswith("rank_"), GameStates.waiting_rank)
-async def cb_rank(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    await state.update_data(rank=callback.data.split("_")[1])
-    await callback.message.edit_text("🃏 اختر النوع:", reply_markup=suits_kb())
-    await state.set_state(GameStates.waiting_suit)
-
-@dp.callback_query(F.data.startswith("suit_"), GameStates.waiting_suit)
-async def cb_suit(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    await state.update_data(suit=callback.data.split("_")[1])
-    await callback.message.edit_text("اختر الضربة السابقة:", reply_markup=prev_kb())
-    await state.set_state(GameStates.waiting_prev)
-
-@dp.callback_query(F.data.startswith("prev_"), GameStates.waiting_prev)
-async def cb_prev(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    data = await state.get_data()
-    prev = callback.data.replace("prev_","")
-    await state.update_data(prev=prev)
-
-    left_p, left_c = await predict_hand("left", data["rank"], data["suit"], prev, LEFT_HANDS)
-    right_p, right_c = await predict_hand("right", data["rank"], data["suit"], prev, RIGHT_HANDS)
-
-    await callback.message.edit_text(
-        f"<b>🤖 توقع البوت:</b>\n\n"
-        f"⬅️ يسار: {LEFT_LABELS.get(left_p, left_p)} <i>({left_c}%)</i>\n"
-        f"➡️ يمين: {RIGHT_LABELS.get(right_p, right_p)} <i>({right_c}%)</i>",
-        reply_markup=after_prediction_kb()
-    )
-
-# ================= حفظ النتيجة الفعلية =================
-@dp.callback_query(F.data == "record_result")
-async def start_record(callback: CallbackQuery, state: FSMContext):
-    if not await is_trainer(callback.from_user.id):
-        await callback.answer("فقط المدربين يقدرون يسجلون النتيجة الفعلية", show_alert=True)
+    parts = message.text.split()
+    if len(parts)!=2:
+        await message.answer("استخدم:\n/code XXXXX")
         return
-    await callback.answer()
-    await callback.message.edit_text("📝 اختر نتيجة اليسار الفعلية:", reply_markup=left_actual_kb())
-    await state.set_state(RecordStates.waiting_actual_left)
+    code = parts[1].upper()
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT days,plan,type,used FROM codes WHERE code=$1", code)
+        if not row or row["used"]:
+            await message.answer("❌ كود غير صالح أو مستخدم")
+            return
+        await conn.execute("UPDATE codes SET used=TRUE WHERE code=$1", code)
+        await activate_user(message.from_user.id, row["days"], row["plan"], type=row["type"])
+        msg = f"🔥 تم التفعيل\n💎 خطتك: {row['plan']}"
+        if row["type"]=="trainer":
+            msg = f"🔥 تم تفعيلك كمدرب\n💎 خطتك: {row['plan']}"
+        await message.answer(msg)
 
-@dp.callback_query(F.data.startswith("act_left_"), RecordStates.waiting_actual_left)
-async def actual_left(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    actual_left = callback.data.replace("act_left_","")
-    await state.update_data(actual_left=actual_left)
-    await callback.message.edit_text("📝 اختر نتيجة اليمين الفعلية:", reply_markup=right_actual_kb())
-    await state.set_state(RecordStates.waiting_actual_right)
+# ================= ADMIN COMMANDS =================
+@dp.message(Command("admin"))
+async def admin_guess_mode(message: Message):
+    parts = message.text.split()
+    user_id = message.from_user.id
+    if user_id not in [ADMIN_ID] + TRAINER_IDS: return
+    if len(parts)==2 and parts[1].lower()=="king":
+        user_temp[user_id]={"mode":"guess_only"}
+        await message.answer("🎲 وضع التخمين مفعل. اختر رقم الورقة:", reply_markup=ranks_kb())
+    else:
+        await message.answer("❌ الأمر غير صالح")
 
-@dp.callback_query(F.data.startswith("act_right_"), RecordStates.waiting_actual_right)
-async def actual_right(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    data = await state.get_data()
-    actual_right = callback.data.replace("act_right_","")
+@dp.message(Command("train"))
+async def admin_train_mode(message: Message):
+    if message.from_user.id not in [ADMIN_ID] + TRAINER_IDS: return
+    user_temp[message.from_user.id]={"mode":"training"}
+    await message.answer("🧠 وضع التدريب مفعل. اختر رقم الورقة لتدريب البوت:", reply_markup=ranks_kb())
 
-    # تدريب على النتائج الحقيقية
-    await train_ai("left", data["rank"], data["suit"], data["prev"], data["actual_left"])
-    await train_ai("right", data["rank"], data["suit"], data["prev"], actual_right)
+# ================= CALLBACKS =================
+@dp.callback_query(lambda c:c.data.startswith("rank_"))
+async def choose_rank(callback:CallbackQuery):
+    await callback.answer()
+    user_temp[callback.from_user.id]["rank"]=callback.data.split("_")[1]
+    await callback.message.edit_text("اختر النوع:",reply_markup=suits_kb())
+
+@dp.callback_query(lambda c:c.data.startswith("suit_"))
+async def choose_suit(callback:CallbackQuery):
+    await callback.answer()
+    user_temp[callback.from_user.id]["suit"]=callback.data.split("_")[1]
+    await callback.message.edit_text("اختر الضربة السابقة:", reply_markup=prev_hands_kb())
+
+@dp.callback_query(lambda c:c.data.startswith("prev_"))
+async def handle_prev(callback:CallbackQuery):
+    user_id = callback.from_user.id
+    await callback.answer()
+    data = user_temp.get(user_id)
+    if not data:
+        await callback.message.answer("ابدأ من جديد /start")
+        return
+    prev = callback.data.replace("prev_","")
+    user_temp[user_id]["prev"]=prev
+
+    left_pred,left_conf = await predict_hand("left", data["rank"], data["suit"], prev, LEFT_HANDS)
+    right_pred,right_conf = await predict_hand("right", data["rank"], data["suit"], prev, RIGHT_HANDS)
+
+    mode = data.get("mode","guess_only")
+    if mode=="training":
+        await train_ai("left", data["rank"], data["suit"], prev, left_pred)
+        await train_ai("right", data["rank"], data["suit"], prev, right_pred)
 
     await callback.message.edit_text(
-        "✅ تم حفظ النتيجة الفعلية!\n"
-        "البوت تعلم من اللعبة الحقيقية 🎯\n\n"
-        "اضغط التالي لتوقع جديد",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔄 التخمين التالي", callback_data="next")]
-        ])
+        f"⬅️ يسار: {LEFT_HANDS_LABELS.get(left_pred,left_pred)} ({left_conf}%)\n"
+        f"➡️ يمين: {RIGHT_HANDS_LABELS.get(right_pred,right_pred)} ({right_conf}%)",
+        reply_markup=next_guess_kb()
     )
-    await state.clear()
 
-@dp.callback_query(F.data == "next")
-async def next_guess(callback: CallbackQuery, state: FSMContext):
+@dp.callback_query(lambda c:c.data=="next_guess")
+async def next_guess(callback:CallbackQuery):
+    user_temp.pop(callback.from_user.id,None)
     await callback.answer()
-    await state.clear()
-    await callback.message.edit_text("🃏 اختر رقم الورقة الجديد:", reply_markup=ranks_kb())
-    await state.set_state(GameStates.waiting_rank)
+    await callback.message.edit_text("ابدأ التخمين الجديد:", reply_markup=ranks_kb())
 
 # ================= WEBHOOK =================
 async def main():
+    import logging
+    logging.basicConfig(level=logging.INFO)
     await init_db()
     await bot.delete_webhook(drop_pending_updates=True)
-    
-    app = web.Application()
-    SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
-    setup_application(app, dp)
-    
-    port = int(os.getenv("PORT", 8080))
-    runner = web.AppRunner(app)
+    app=web.Application()
+    SimpleRequestHandler(dispatcher=dp,bot=bot).register(app,path=WEBHOOK_PATH)
+    setup_application(app,dp)
+    port=int(os.getenv("PORT",8080))
+    runner=web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
+    site=web.TCPSite(runner,"0.0.0.0",port)
     await site.start()
-    
-    await bot.set_webhook(f"{WEBHOOK_URL.rstrip('/')}{WEBHOOK_PATH}")
-    logger.info("🚀 Bot deployed successfully")
+    webhook_base=os.environ["WEBHOOK_URL"]
+    await bot.set_webhook(f"{webhook_base.rstrip('/')}{WEBHOOK_PATH}")
     await asyncio.Event().wait()
 
-if __name__ == "__main__":
+if __name__=="__main__":
     asyncio.run(main())
