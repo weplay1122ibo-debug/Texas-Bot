@@ -126,6 +126,22 @@ def activate_code(user_id, code):
     return True, "✅ تم التفعيل!\nجاهز للعب فوراً 🔥"
 
 # ================= ADMIN COMMANDS =================
+@dp.message(lambda m: m.text and m.text.startswith("/addcode"))
+async def add_code(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    parts = message.text.split()
+    days = int(parts[1]) if len(parts) > 1 else 7
+    code = generate_code()
+    codes[code] = {"used": False, "days": days}
+    save_json(CODES_FILE, codes)
+    await message.answer(
+        f"✅ كود جديد تم إنشاؤه!\n\n"
+        f"`{code}`\n"
+        f"المدة: {days} يوم",
+        parse_mode="Markdown"
+    )
+
 @dp.message(Command("users"))
 @dp.message(Command("subscribers"))
 async def show_subscribers(message: Message):
@@ -240,7 +256,6 @@ async def handle_hand(callback: CallbackQuery):
     suit = data.get("suit")
     if not rank or not suit: return
 
-    # حفظ النتيجة الفعلية (للجميع)
     if data.get("mode") == "verify_actual":
         actual = chosen
         predicted_high = data["predicted_high"]
@@ -264,7 +279,6 @@ async def handle_hand(callback: CallbackQuery):
         user_temp.pop(user_id, None)
         return
 
-    # التوقع العادي + طلب النتيجة
     result_text, predicted_high = predict_hand(rank, suit, chosen)
 
     user_temp[user_id] = {
@@ -280,7 +294,7 @@ async def handle_hand(callback: CallbackQuery):
         reply_markup=hands_kb()
     )
 
-# ================= WEBHOOK =================
+# ================= WEBHOOK FOR RENDER =================
 WEBHOOK_PATH = "/webhook"
 
 async def main():
