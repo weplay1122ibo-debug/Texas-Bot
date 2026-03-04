@@ -1,13 +1,13 @@
-# nixpacks.toml
-
 [phases.setup]
-nixPkgs = ['python311', 'python311Packages.pip', 'gcc']
+nixPkgs = ["python311", "python311Packages.pip", "gcc"]
 
 [phases.build]
 cmds = [
-  'python3.11 -m pip install --upgrade pip wheel setuptools',
-  'python3.11 -m pip install -r requirements.txt --no-cache-dir --prefer-binary'
+  "python3.11 -m pip install --upgrade pip wheel setuptools",
+  "python3.11 -m pip install -r requirements.txt --no-cache-dir --prefer-binary"
 ]
 
 [start]
 cmd = "python3.11 bot.py"
+
+providers = ["python"]
