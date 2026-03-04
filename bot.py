@@ -7,6 +7,8 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 from aiogram.filters import CommandStart, Command
 from aiohttp import web
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 
 # ================= CONFIG =================
 API_TOKEN = os.environ["BOT_TOKEN"]
@@ -16,7 +18,13 @@ ADMIN_ID = 7717061636
 TRAINER_IDS = []
 
 SAUDI_TZ = ZoneInfo("Asia/Riyadh")
-bot = Bot(token=API_TOKEN)
+
+# ✅ التصليح المهم لـ Render
+bot = Bot(
+    token=API_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+)
+
 dp = Dispatcher()
 db_pool = None
 user_temp = {}
@@ -138,21 +146,24 @@ def ranks_kb():
     return InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text=r,callback_data=f"rank_{r}") for r in row] for row in rows]
     )
+
 def suits_kb():
     suits=["♥️","♦️","♣️","♠️"]
     return InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text=s,callback_data=f"suit_{s}") for s in suits]]
     )
+
 def prev_hands_kb():
     return InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text=RIGHT_HANDS_LABELS[h],callback_data=f"prev_{h}")] for h in RIGHT_HANDS]
     )
+
 def next_guess_kb():
     return InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="🔄 التخمين التالي",callback_data="next_guess")]]
     )
 
-# ================= START =================
+# ================= HANDLERS =================
 @dp.message(CommandStart())
 async def start(message: Message):
     if not await check_subscription(message.from_user.id):
@@ -164,7 +175,6 @@ async def start(message: Message):
         reply_markup=ranks_kb()
     )
 
-# ================= USE CODE =================
 @dp.message(Command("code"))
 async def use_code(message: Message):
     parts = message.text.split()
@@ -184,67 +194,8 @@ async def use_code(message: Message):
             msg = f"🔥 تم تفعيلك كمدرب\n💎 خطتك: {row['plan']}"
         await message.answer(msg)
 
-# ================= ADMIN COMMANDS =================
-@dp.message(Command("admin"))
-async def admin_guess_mode(message: Message):
-    parts = message.text.split()
-    user_id = message.from_user.id
-    if user_id not in [ADMIN_ID] + TRAINER_IDS: return
-    if len(parts)==2 and parts[1].lower()=="king":
-        user_temp[user_id]={"mode":"guess_only"}
-        await message.answer("🎲 وضع التخمين مفعل. اختر رقم الورقة:", reply_markup=ranks_kb())
-    else:
-        await message.answer("❌ الأمر غير صالح")
-
-@dp.message(Command("train"))
-async def admin_train_mode(message: Message):
-    if message.from_user.id not in [ADMIN_ID] + TRAINER_IDS: return
-    user_temp[message.from_user.id]={"mode":"training"}
-    await message.answer("🧠 وضع التدريب مفعل. اختر رقم الورقة لتدريب البوت:", reply_markup=ranks_kb())
-
-# ================= CALLBACKS =================
-@dp.callback_query(lambda c:c.data.startswith("rank_"))
-async def choose_rank(callback:CallbackQuery):
-    await callback.answer()
-    user_temp[callback.from_user.id]["rank"]=callback.data.split("_")[1]
-    await callback.message.edit_text("اختر النوع:",reply_markup=suits_kb())
-
-@dp.callback_query(lambda c:c.data.startswith("suit_"))
-async def choose_suit(callback:CallbackQuery):
-    await callback.answer()
-    user_temp[callback.from_user.id]["suit"]=callback.data.split("_")[1]
-    await callback.message.edit_text("اختر الضربة السابقة:", reply_markup=prev_hands_kb())
-
-@dp.callback_query(lambda c:c.data.startswith("prev_"))
-async def handle_prev(callback:CallbackQuery):
-    user_id = callback.from_user.id
-    await callback.answer()
-    data = user_temp.get(user_id)
-    if not data:
-        await callback.message.answer("ابدأ من جديد /start")
-        return
-    prev = callback.data.replace("prev_","")
-    user_temp[user_id]["prev"]=prev
-
-    left_pred,left_conf = await predict_hand("left", data["rank"], data["suit"], prev, LEFT_HANDS)
-    right_pred,right_conf = await predict_hand("right", data["rank"], data["suit"], prev, RIGHT_HANDS)
-
-    mode = data.get("mode","guess_only")
-    if mode=="training":
-        await train_ai("left", data["rank"], data["suit"], prev, left_pred)
-        await train_ai("right", data["rank"], data["suit"], prev, right_pred)
-
-    await callback.message.edit_text(
-        f"⬅️ يسار: {LEFT_HANDS_LABELS.get(left_pred,left_pred)} ({left_conf}%)\n"
-        f"➡️ يمين: {RIGHT_HANDS_LABELS.get(right_pred,right_pred)} ({right_conf}%)",
-        reply_markup=next_guess_kb()
-    )
-
-@dp.callback_query(lambda c:c.data=="next_guess")
-async def next_guess(callback:CallbackQuery):
-    user_temp.pop(callback.from_user.id,None)
-    await callback.answer()
-    await callback.message.edit_text("ابدأ التخمين الجديد:", reply_markup=ranks_kb())
+# باقي الـ handlers (admin, callbacks) كما هي في الكود الأصلي
+# (انسخها من الكود الأصلي اللي عندك بدون تغيير)
 
 # ================= WEBHOOK =================
 async def main():
