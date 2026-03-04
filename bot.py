@@ -3,12 +3,15 @@ import logging
 import random
 import string
 import json
+import os
 from datetime import datetime, timedelta
 from collections import deque
 
 from aiogram import Bot, Dispatcher
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiohttp import web
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 # ================= CONFIG =================
 API_TOKEN = "8664632562:AAHD6xaPk01W7cfX1zADS8hRwh-mfVW7s4k"
@@ -97,9 +100,8 @@ def predict_hand(rank, suit, last_hand=None):
     mid = sorted_hands[1]
     low = sorted_hands[-1]
 
-    note = "\n\n🧠 الذكاء لسة في طور التدريب (كل ما يدرب الأدمن يصير أدق)" if get_training_count() < 20 else ""
+    note = "\n\n🧠 الذكاء لسة في طور التدريب" if get_training_count() < 20 else ""
 
-    # كتابة النص بطريقة آمنة 100% (بدون adjacent f-strings)
     text = f"""🎯 TEXAS AI V8 ULTRA
 
 🔥 عالي:
@@ -113,7 +115,7 @@ def predict_hand(rank, suit, last_hand=None):
 
     return text, high[0]
 
-# ================= SUBSCRIPTION =================
+# ================= SUBSCRIPTION & ADMIN =================
 def generate_code():
     return ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
 
@@ -135,7 +137,7 @@ def activate_code(user_id, code):
 def get_today_key():
     return datetime.now().strftime("%Y-%m-%d")
 
-# ================= KEYBOARDS =================
+# KEYBOARDS (نفسها)
 def ranks_kb():
     ranks = ["A","K","Q","J","10","9","8","7","6","5","4","3","2"]
     rows = [ranks[i:i+4] for i in range(0, len(ranks), 4)]
@@ -154,7 +156,7 @@ def hands_kb(optional=False):
         kb.append([InlineKeyboardButton(text="بدون", callback_data="hand_none")])
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
-# ================= ADMIN =================
+# ADMIN COMMANDS
 @dp.message(Command("addcode"))
 async def add_code(message: Message):
     if message.from_user.id != ADMIN_ID: return
@@ -174,8 +176,7 @@ async def train(message: Message):
 @dp.message(Command("trainstatus"))
 async def train_status(message: Message):
     if message.from_user.id != ADMIN_ID: return
-    count = get_training_count()
-    await message.answer(f"📊 حالة التدريب\n\nعدد الجولات المدربة: **{count}**\n\nكل ما تدرب أكثر = البوت يصير أذكى 🔥")
+    await message.answer(f"📊 عدد الجولات المدربة: **{get_training_count()}**")
 
 @dp.message(Command("stats"))
 async def show_stats(message: Message):
@@ -183,14 +184,129 @@ async def show_stats(message: Message):
     today_key = get_today_key()
     today = daily_stats.get(today_key, {"total": 0, "correct": 0})
     t_perc = round(today["correct"] / today["total"] * 100, 1) if today["total"] else 0
-    
     all_total = sum(d.get("total", 0) for d in daily_stats.values())
     all_correct = sum(d.get("correct", 0) for d in daily_stats.values())
     o_perc = round(all_correct / all_total * 100, 1) if all_total else 0
 
-    await message.answer(
-        f"📊 إحصائيات TEXAS AI V8\n\n"
-        f"📅 اليوم:\nالتخمينات: {today['total']}\nالصحيحة: {today['correct']}\nالنسبة: {t_perc}%\n\n"
-        f"📈 الإجمالي:\nالتخمينات: {all_total}\nالصحيحة: {all_correct}\nالنسبة: {o_perc}%\n\n"
-        f"🧠 جولات التدريب: **{get_training_count()}**"
-    )
+    await message.answer(f"📊 إحصائيات\n\nاليوم: {t_perc}%\nالإجمالي: {o_perc}%\nجولات التدريب: {get_training_count()}")
+
+# ================= FLOW =================
+@dp.message(CommandStart())
+async def start(message: Message):
+    await message.answer("🔥 TEXAS AI V8\nادخل كود الاشتراك")
+
+@dp.message()
+async def handle_text(message: Message):
+    user_id = message.from_user.id
+    if not check_subscription(user_id):
+        ok, msg = activate_code(user_id, message.text.strip())
+        await message.answer(msg)
+        if ok:
+            await message.answer("اختر رقم الورقة:", reply_markup=ranks_kb())
+        return
+    await message.answer("اختر رقم الورقة:", reply_markup=ranks_kb())
+
+# Callback handlers (نفس السابق)
+@dp.callback_query(lambda c: c.data.startswith("rank_"))
+async def choose_rank(callback: CallbackQuery):
+    await callback.answer()
+    user_temp[callback.from_user.id] = user_temp.get(callback.from_user.id, {})
+    user_temp[callback.from_user.id]["rank"] = callback.data.split("_")[1]
+    await callback.message.edit_text("اختر النوع:", reply_markup=suits_kb())
+
+@dp.callback_query(lambda c: c.data.startswith("suit_"))
+async def choose_suit(callback: CallbackQuery):
+    await callback.answer()
+    data = user_temp.get(callback.from_user.id, {})
+    if not data or "rank" not in data:
+        await callback.message.edit_text("ابدأ من جديد")
+        return
+    data["suit"] = callback.data.split("_")[1]
+    await callback.message.edit_text("الضربة السابقة؟ (اختياري)", reply_markup=hands_kb(optional=True))
+
+@dp.callback_query(lambda c: c.data.startswith("hand_"))
+async def choose_hand(callback: CallbackQuery):
+    await callback.answer()
+    user_id = callback.from_user.id
+    data = user_temp.get(user_id)
+    if not data:
+        await callback.answer("الجلسة انتهت، ابدأ من جديد", show_alert=True)
+        return
+
+    chosen = callback.data.replace("hand_", "")
+    if chosen == "none": chosen = None
+
+    rank = data.get("rank")
+    suit = data.get("suit")
+    if not rank or not suit: return
+
+    if user_id == ADMIN_ID and data.get("mode") == "train_result":
+        train_ai(rank, suit, data.get("prev"), chosen)
+        await callback.message.edit_text("✅ تم حفظ التدريب\nالذكاء يزيد يومياً 🔥")
+        user_temp.pop(user_id, None)
+        return
+
+    if user_id == ADMIN_ID and data.get("mode") == "train":
+        data["prev"] = chosen
+        data["mode"] = "train_result"
+        await callback.message.edit_text("شنو كانت النتيجة الفعلية؟", reply_markup=hands_kb())
+        return
+
+    if user_id == ADMIN_ID and data.get("mode") == "verify_actual":
+        actual = chosen
+        predicted_high = data["predicted_high"]
+        prev = data["prev"]
+
+        today_key = get_today_key()
+        if today_key not in daily_stats:
+            daily_stats[today_key] = {"total": 0, "correct": 0}
+
+        daily_stats[today_key]["total"] += 1
+        if actual == predicted_high:
+            daily_stats[today_key]["correct"] += 1
+            status = "✅ التخمين العالي صحيح!"
+        else:
+            status = f"❌ التخمين العالي كان: {predicted_high}\nالفعلي: {actual}"
+
+        train_ai(rank, suit, prev, actual)
+        save_daily_stats()
+        await callback.message.edit_text(f"{status}\n\n📊 تم تحديث الإحصائيات")
+        user_temp.pop(user_id, None)
+        return
+
+    result_text, _ = predict_hand(rank, suit, chosen)
+    await callback.message.edit_text(result_text)
+    user_temp.pop(user_id, None)
+
+# ================= WEBHOOK FOR RENDER =================
+WEBHOOK_PATH = "/webhook"
+
+async def main():
+    logging.basicConfig(level=logging.INFO)
+    load_training()
+    asyncio.create_task(auto_save())
+
+    await bot.delete_webhook(drop_pending_updates=True)
+
+    app = web.Application()
+    SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
+    setup_application(app, dp)
+
+    port = int(os.getenv("PORT", 8080))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
+    webhook_base = os.getenv("WEBHOOK_URL")
+    if webhook_base:
+        full_url = webhook_base.rstrip("/") + WEBHOOK_PATH
+        await bot.set_webhook(full_url)
+        logging.info(f"✅ Webhook set: {full_url}")
+    else:
+        logging.error("❌ WEBHOOK_URL غير معرف في Environment Variables")
+
+    await asyncio.Event().wait()
+
+if __name__ == "__main__":
+    asyncio.run(main())
