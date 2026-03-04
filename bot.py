@@ -97,25 +97,16 @@ def predict_hand(rank, suit, last_hand=None):
     sorted_hands = sorted(percentages.items(), key=lambda x: x[1], reverse=True)
 
     high = sorted_hands[0]
-    mid = sorted_hands[1]
-    low = sorted_hands[-1]
-
-    note = "\n\n🧠 الذكاء لسة في طور التدريب" if get_training_count() < 20 else ""
 
     text = f"""🎯 TEXAS AI V8 ULTRA
 
-🔥 عالي:
-{high[0]} ({high[1]}%)
-
-⚖️ متوسط:
-{mid[0]} ({mid[1]}%)
-
-⚠️ منخفض:
-{low[0]} ({low[1]}%){note}"""
+🔥 عالي: {high[0]} ({high[1]}%)
+⚖️ متوسط: {sorted_hands[1][0]} ({sorted_hands[1][1]}%)
+⚠️ منخفض: {sorted_hands[-1][0]} ({sorted_hands[-1][1]}%)"""
 
     return text, high[0]
 
-# ================= SUBSCRIPTION & ADMIN =================
+# ================= SUBSCRIPTION =================
 def generate_code():
     return ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
 
@@ -132,12 +123,9 @@ def activate_code(user_id, code):
     codes[code]["used"] = True
     save_json(USERS_FILE, users)
     save_json(CODES_FILE, codes)
-    return True, "✅ تم تفعيل الاشتراك بنجاح!\nجاهز للعب فوراً 🔥"
+    return True, "✅ تم التفعيل!\nجاهز للعب فوراً 🔥"
 
-def get_today_key():
-    return datetime.now().strftime("%Y-%m-%d")
-
-# KEYBOARDS (نفسها)
+# ================= KEYBOARDS =================
 def ranks_kb():
     ranks = ["A","K","Q","J","10","9","8","7","6","5","4","3","2"]
     rows = [ranks[i:i+4] for i in range(0, len(ranks), 4)]
@@ -149,14 +137,13 @@ def suits_kb():
     suits = ["♥️","♦️","♣️","♠️"]
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=s, callback_data=f"suit_{s}") for s in suits]])
 
-def hands_kb(optional=False):
+def hands_kb():
     hands = ["👥 زوجين", "🔗 متتالية", "🎴 ثلاثة", "♠️ فلش", "🏠 فل هاوس", "🂡 أربعة", "🌟 ستريت فلش"]
-    kb = [[InlineKeyboardButton(text=h, callback_data=f"hand_{h}")] for h in hands]
-    if optional:
-        kb.append([InlineKeyboardButton(text="بدون", callback_data="hand_none")])
-    return InlineKeyboardMarkup(inline_keyboard=kb)
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=h, callback_data=f"hand_{h}")] for h in hands
+    ])
 
-# ADMIN COMMANDS
+# ================= ADMIN =================
 @dp.message(Command("addcode"))
 async def add_code(message: Message):
     if message.from_user.id != ADMIN_ID: return
@@ -167,12 +154,6 @@ async def add_code(message: Message):
     save_json(CODES_FILE, codes)
     await message.answer(f"كود جديد:\n`{code}`\nالمدة: {days} يوم", parse_mode="Markdown")
 
-@dp.message(Command("train"))
-async def train(message: Message):
-    if message.from_user.id != ADMIN_ID: return
-    user_temp[message.from_user.id] = {"mode": "train"}
-    await message.answer("اختر رقم الورقة:", reply_markup=ranks_kb())
-
 @dp.message(Command("trainstatus"))
 async def train_status(message: Message):
     if message.from_user.id != ADMIN_ID: return
@@ -181,14 +162,19 @@ async def train_status(message: Message):
 @dp.message(Command("stats"))
 async def show_stats(message: Message):
     if message.from_user.id != ADMIN_ID: return
-    today_key = get_today_key()
+    today_key = datetime.now().strftime("%Y-%m-%d")
     today = daily_stats.get(today_key, {"total": 0, "correct": 0})
     t_perc = round(today["correct"] / today["total"] * 100, 1) if today["total"] else 0
     all_total = sum(d.get("total", 0) for d in daily_stats.values())
     all_correct = sum(d.get("correct", 0) for d in daily_stats.values())
     o_perc = round(all_correct / all_total * 100, 1) if all_total else 0
 
-    await message.answer(f"📊 إحصائيات\n\nاليوم: {t_perc}%\nالإجمالي: {o_perc}%\nجولات التدريب: {get_training_count()}")
+    await message.answer(
+        f"📊 إحصائيات TEXAS AI V8\n\n"
+        f"📅 اليوم:\nالتخمينات: {today['total']}\nالصحيحة: {today['correct']} ({t_perc}%)\n\n"
+        f"📈 الإجمالي:\nالتخمينات: {all_total}\nالصحيحة: {all_correct} ({o_perc}%)\n\n"
+        f"🧠 إجمالي التدريبات: {get_training_count()}"
+    )
 
 # ================= FLOW =================
 @dp.message(CommandStart())
@@ -206,7 +192,6 @@ async def handle_text(message: Message):
         return
     await message.answer("اختر رقم الورقة:", reply_markup=ranks_kb())
 
-# Callback handlers (نفس السابق)
 @dp.callback_query(lambda c: c.data.startswith("rank_"))
 async def choose_rank(callback: CallbackQuery):
     await callback.answer()
@@ -222,7 +207,7 @@ async def choose_suit(callback: CallbackQuery):
         await callback.message.edit_text("ابدأ من جديد")
         return
     data["suit"] = callback.data.split("_")[1]
-    await callback.message.edit_text("الضربة السابقة؟ (اختياري)", reply_markup=hands_kb(optional=True))
+    await callback.message.edit_text("الضربة السابقة؟ (اختياري)", reply_markup=hands_kb())
 
 @dp.callback_query(lambda c: c.data.startswith("hand_"))
 async def choose_hand(callback: CallbackQuery):
@@ -240,42 +225,54 @@ async def choose_hand(callback: CallbackQuery):
     suit = data.get("suit")
     if not rank or not suit: return
 
-    if user_id == ADMIN_ID and data.get("mode") == "train_result":
-        train_ai(rank, suit, data.get("prev"), chosen)
-        await callback.message.edit_text("✅ تم حفظ التدريب\nالذكاء يزيد يومياً 🔥")
-        user_temp.pop(user_id, None)
+    # التوقع + طلب النتيجة الفعلية (للجميع)
+    result_text, predicted_high = predict_hand(rank, suit, chosen)
+
+    user_temp[user_id] = {
+        "mode": "verify_actual",
+        "predicted_high": predicted_high,
+        "rank": rank,
+        "suit": suit,
+        "prev": chosen
+    }
+
+    await callback.message.edit_text(
+        result_text + "\n\n🔍 ما كانت النتيجة الفعلية؟",
+        reply_markup=hands_kb()
+    )
+
+# حفظ النتيجة الفعلية من أي مستخدم
+@dp.callback_query(lambda c: c.data.startswith("hand_"))
+async def verify_actual(callback: CallbackQuery):
+    await callback.answer()
+    user_id = callback.from_user.id
+    data = user_temp.get(user_id)
+    if not data or data.get("mode") != "verify_actual":
         return
 
-    if user_id == ADMIN_ID and data.get("mode") == "train":
-        data["prev"] = chosen
-        data["mode"] = "train_result"
-        await callback.message.edit_text("شنو كانت النتيجة الفعلية؟", reply_markup=hands_kb())
-        return
+    actual = callback.data.replace("hand_", "")
+    if actual == "none": actual = None
 
-    if user_id == ADMIN_ID and data.get("mode") == "verify_actual":
-        actual = chosen
-        predicted_high = data["predicted_high"]
-        prev = data["prev"]
+    predicted_high = data["predicted_high"]
+    rank = data["rank"]
+    suit = data["suit"]
+    prev = data["prev"]
 
-        today_key = get_today_key()
-        if today_key not in daily_stats:
-            daily_stats[today_key] = {"total": 0, "correct": 0}
+    today_key = datetime.now().strftime("%Y-%m-%d")
+    if today_key not in daily_stats:
+        daily_stats[today_key] = {"total": 0, "correct": 0}
 
-        daily_stats[today_key]["total"] += 1
-        if actual == predicted_high:
-            daily_stats[today_key]["correct"] += 1
-            status = "✅ التخمين العالي صحيح!"
-        else:
-            status = f"❌ التخمين العالي كان: {predicted_high}\nالفعلي: {actual}"
+    daily_stats[today_key]["total"] += 1
+    if actual == predicted_high:
+        daily_stats[today_key]["correct"] += 1
+        status = "✅ التخمين صحيح! شكراً على التدريب 🔥"
+    else:
+        status = f"❌ التخمين كان: {predicted_high}\nالفعلي: {actual}\nشكراً على المساهمة"
 
-        train_ai(rank, suit, prev, actual)
-        save_daily_stats()
-        await callback.message.edit_text(f"{status}\n\n📊 تم تحديث الإحصائيات")
-        user_temp.pop(user_id, None)
-        return
+    train_ai(rank, suit, prev, actual)
+    save_daily_stats()
 
-    result_text, _ = predict_hand(rank, suit, chosen)
-    await callback.message.edit_text(result_text)
+    await callback.message.edit_text(status)
     user_temp.pop(user_id, None)
 
 # ================= WEBHOOK FOR RENDER =================
@@ -304,7 +301,7 @@ async def main():
         await bot.set_webhook(full_url)
         logging.info(f"✅ Webhook set: {full_url}")
     else:
-        logging.error("❌ WEBHOOK_URL غير معرف في Environment Variables")
+        logging.error("❌ WEBHOOK_URL غير معرف!")
 
     await asyncio.Event().wait()
 
