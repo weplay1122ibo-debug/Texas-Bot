@@ -1,57 +1,28 @@
 import asyncio
 import logging
 import os
-import sqlite3
+import asyncpg
 from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.filters import CommandStart, Command
+from aiogram.filters import CommandStart
 from aiohttp import web
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
-# ================== CONFIG ==================
-API_TOKEN = "8664632562:AAHD6xaPk01W7cfX1zADS8hRwh-mfVW7s4k"
+# ================= CONFIG =================
+API_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = 7717061636
-
 WEBHOOK_PATH = "/webhook"
-DB_FILE = "/var/data/texas_ai_v10.db"
+
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
 
+db_pool = None
 user_temp = {}
 
-# ================== DATABASE ==================
-def init_db():
-    os.makedirs("/var/data", exist_ok=True)
-
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS training (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        side TEXT,
-        rank TEXT,
-        suit TEXT,
-        prev TEXT,
-        result TEXT,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
-    """)
-
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        user_id TEXT PRIMARY KEY,
-        expire DATETIME
-    )
-    """)
-
-    conn.commit()
-    conn.close()
-
-# ================== AI ENGINE V10 ==================
 HANDS = [
     "👥 زوجين",
     "🔗 متتالية",
@@ -62,82 +33,89 @@ HANDS = [
     "🌟 ستريت فلش"
 ]
 
-def train_ai(side, rank, suit, prev, result):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
+# ================= DATABASE =================
+async def init_db():
+    global db_pool
+    db_pool = await asyncpg.create_pool(DATABASE_URL)
 
-    c.execute("""
-        INSERT INTO training (side, rank, suit, prev, result)
-        VALUES (?, ?, ?, ?, ?)
-    """, (side, rank, suit, prev, result))
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS training (
+            id SERIAL PRIMARY KEY,
+            side TEXT,
+            rank TEXT,
+            suit TEXT,
+            prev TEXT,
+            result TEXT,
+            created_at TIMESTAMP DEFAULT NOW()
+        )
+        """)
 
-    conn.commit()
-    conn.close()
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id TEXT PRIMARY KEY,
+            expire TIMESTAMP
+        )
+        """)
 
-def predict_hand(side, rank, suit, prev):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
+# ================= AI ENGINE =================
+async def train_ai(side, rank, suit, prev, result):
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO training (side, rank, suit, prev, result)
+            VALUES ($1,$2,$3,$4,$5)
+        """, side, rank, suit, prev, result)
 
+async def predict_hand(side, rank, suit, prev):
     scores = {h: 1 for h in HANDS}
 
-    c.execute("""
-        SELECT rank, suit, prev, result
-        FROM training
-        WHERE side = ?
-        ORDER BY id DESC
-        LIMIT 1500
-    """, (side,))
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT rank, suit, prev, result
+            FROM training
+            WHERE side = $1
+            ORDER BY id DESC
+            LIMIT 1500
+        """, side)
 
-    rows = c.fetchall()
-    conn.close()
+    for r in rows:
+        r_rank = r["rank"]
+        r_suit = r["suit"]
+        r_prev = r["prev"]
+        r_result = r["result"]
 
-    for r_rank, r_suit, r_prev, r_result in rows:
-
-        # تطابق كامل
         if r_rank == rank and r_suit == suit and r_prev == prev:
             scores[r_result] += 25
-
-        # rank + prev
         elif r_rank == rank and r_prev == prev:
             scores[r_result] += 12
-
-        # prev فقط (Markov effect)
         elif r_prev == prev:
             scores[r_result] += 9
-
-        # rank فقط
         elif r_rank == rank:
             scores[r_result] += 4
-
         else:
             scores[r_result] += 1
 
-    sorted_hands = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-    return sorted_hands[0][0]
+    return max(scores, key=scores.get)
 
-# ================== SUBSCRIPTION ==================
-def check_subscription(user_id):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT expire FROM users WHERE user_id = ?", (str(user_id),))
-    row = c.fetchone()
-    conn.close()
-
+# ================= SUBSCRIPTION =================
+async def check_subscription(user_id):
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT expire FROM users WHERE user_id=$1", str(user_id))
     if not row:
         return False
+    return row["expire"] > datetime.now()
 
-    return datetime.fromisoformat(row[0]) > datetime.now()
-
-def activate_user(user_id, days=30):
+async def activate_user(user_id, days=3650):
     expire = datetime.now() + timedelta(days=days)
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("REPLACE INTO users (user_id, expire) VALUES (?, ?)",
-              (str(user_id), expire.isoformat()))
-    conn.commit()
-    conn.close()
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO users (user_id, expire)
+            VALUES ($1,$2)
+            ON CONFLICT (user_id)
+            DO UPDATE SET expire=$2
+        """, str(user_id), expire)
 
-# ================== KEYBOARDS ==================
+# ================= KEYBOARDS =================
 def ranks_kb():
     ranks = ["A","K","Q","J","10","9","8","7","6","5","4","3","2"]
     rows = [ranks[i:i+4] for i in range(0, len(ranks), 4)]
@@ -156,12 +134,12 @@ def hands_kb(prefix):
         inline_keyboard=[[InlineKeyboardButton(text=h, callback_data=f"{prefix}_{h}")] for h in HANDS]
     )
 
-# ================== FLOW ==================
+# ================= FLOW =================
 @dp.message(CommandStart())
 async def start(message: Message):
     if message.from_user.id == ADMIN_ID:
-        activate_user(ADMIN_ID, 3650)
-    await message.answer("🔥 TEXAS AI V10\nاختر رقم الورقة:", reply_markup=ranks_kb())
+        await activate_user(ADMIN_ID)
+    await message.answer("🔥 TEXAS AI CLOUD V10\nاختر رقم الورقة:", reply_markup=ranks_kb())
 
 @dp.callback_query(lambda c: c.data.startswith("rank_"))
 async def choose_rank(callback: CallbackQuery):
@@ -180,68 +158,32 @@ async def handle_prev(callback: CallbackQuery):
     await callback.answer()
 
     user_id = callback.from_user.id
-    if not check_subscription(user_id):
+    if not await check_subscription(user_id):
         await callback.message.edit_text("❌ غير مشترك")
         return
 
     prev = callback.data.replace("prev_", "")
-    data = user_temp.get(user_id)
+    data = user_temp[user_id]
 
-    rank = data["rank"]
-    suit = data["suit"]
-
-    left_pred = predict_hand("left", rank, suit, prev)
-    right_pred = predict_hand("right", rank, suit, prev)
+    left_pred = await predict_hand("left", data["rank"], data["suit"], prev)
+    right_pred = await predict_hand("right", data["rank"], data["suit"], prev)
 
     if user_id == ADMIN_ID:
-        user_temp[user_id] = {
-            "mode": "train",
-            "rank": rank,
-            "suit": suit,
-            "prev": prev
-        }
-
+        user_temp[user_id]["prev"] = prev
         await callback.message.edit_text(
-            f"🎯 توقعات V10\n\n⬅️ يسار: {left_pred}\n➡️ يمين: {right_pred}\n\nادخل نتيجة اليسار:",
+            f"⬅️ يسار: {left_pred}\n➡️ يمين: {right_pred}\n\nادخل نتيجة اليسار:",
             reply_markup=hands_kb("train_left")
         )
     else:
         await callback.message.edit_text(
-            f"""🔥 TEXAS AI V10 PRO
-
-⬅️ يسار: {left_pred}
-➡️ يمين: {right_pred}
-
-💎 ذكاء متطور - تدريب حصري"""
+            f"🔥 TEXAS AI V10 CLOUD\n\n⬅️ يسار: {left_pred}\n➡️ يمين: {right_pred}"
         )
 
-@dp.callback_query(lambda c: c.data.startswith("train_left_"))
-async def train_left(callback: CallbackQuery):
-    await callback.answer()
-    user_temp[ADMIN_ID]["left"] = callback.data.replace("train_left_", "")
-    await callback.message.edit_text("ادخل نتيجة اليمين:",
-                                     reply_markup=hands_kb("train_right"))
-
-@dp.callback_query(lambda c: c.data.startswith("train_right_"))
-async def train_right(callback: CallbackQuery):
-    await callback.answer()
-
-    right_result = callback.data.replace("train_right_", "")
-    data = user_temp[ADMIN_ID]
-
-    train_ai("left", data["rank"], data["suit"], data["prev"], data["left"])
-    train_ai("right", data["rank"], data["suit"], data["prev"], right_result)
-
-    await callback.message.edit_text("✅ تم تدريب الذكاء بنجاح 🔥")
-
-    user_temp.pop(ADMIN_ID, None)
-
-# ================== WEBHOOK ==================
+# ================= WEBHOOK =================
 async def main():
     logging.basicConfig(level=logging.INFO)
 
-    init_db()
-
+    await init_db()
     await bot.delete_webhook(drop_pending_updates=True)
 
     app = web.Application()
