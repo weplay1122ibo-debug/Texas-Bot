@@ -18,17 +18,13 @@ API_TOKEN = os.environ["BOT_TOKEN"]
 DATABASE_URL = os.environ["DATABASE_URL"]
 WEBHOOK_PATH = "/webhook"
 ADMIN_ID = 7717061636
-TRAINER_IDS = []  # ضع هنا ID المدرّبين
+TRAINER_IDS = []  # سيتم إضافة المدربين بعد كود خاص
 
 SAUDI_TZ = ZoneInfo("Asia/Riyadh")
-SPECIAL_MINUTES = [1,5,6,8,9,16,17,21,23,27,28,29,35,36,41,45,47,51,53,55,57,58,59]
-ALERT_BEFORE = 2
-
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
 db_pool = None
 user_temp = {}
-last_alert_key = None
 
 # ================= GAME HANDS =================
 LEFT_HANDS = ["none","sequence_same","pair","AA"]
@@ -66,7 +62,8 @@ async def init_db():
             code TEXT PRIMARY KEY,
             days INTEGER,
             plan TEXT,
-            used BOOLEAN DEFAULT FALSE
+            used BOOLEAN DEFAULT FALSE,
+            type TEXT DEFAULT 'user'
         )
         """)
 
@@ -78,7 +75,7 @@ async def check_subscription(user_id):
         row = await conn.fetchrow("SELECT expire FROM users WHERE user_id=$1", str(user_id))
     return row and row["expire"] > datetime.now()
 
-async def activate_user(user_id, days, plan):
+async def activate_user(user_id, days, plan, type="user"):
     async with db_pool.acquire() as conn:
         expire = datetime.now() + timedelta(days=days)
         await conn.execute("""
@@ -87,28 +84,10 @@ async def activate_user(user_id, days, plan):
         ON CONFLICT (user_id)
         DO UPDATE SET expire=$2, plan=$3
         """, str(user_id), expire, plan)
+        if type=="trainer":
+            TRAINER_IDS.append(user_id)
 
-# ================= ALERT SYSTEM =================
-async def send_alerts():
-    global last_alert_key
-    while True:
-        now = datetime.now(SAUDI_TZ)
-        target_minute = (now.minute + ALERT_BEFORE) % 60
-        alert_key = f"{now.hour}:{target_minute}"
-        if target_minute in SPECIAL_MINUTES and alert_key != last_alert_key:
-            async with db_pool.acquire() as conn:
-                rows = await conn.fetch("SELECT user_id FROM users WHERE expire > NOW()")
-            for row in rows:
-                try:
-                    await bot.send_message(int(row["user_id"]),
-                        f"⏰ تنبيه ذكي\nينصح بلعب خماسي خلال {ALERT_BEFORE} دقيقة 🔥\n🎯 الدقيقة المستهدفة: {target_minute}")
-                except: pass
-            last_alert_key = alert_key
-            await asyncio.sleep(60)
-        else:
-            await asyncio.sleep(20)
-
-# ================= AI + Monte Carlo =================
+# ================= AI =================
 async def train_ai(side, rank, suit, prev, result):
     minute = datetime.now(SAUDI_TZ).minute
     async with db_pool.acquire() as conn:
@@ -183,23 +162,65 @@ def next_guess_kb():
         inline_keyboard=[[InlineKeyboardButton(text="🔄 التخمين التالي",callback_data="next_guess")]]
     )
 
-# ================= START / HELP =================
+# ================= START =================
 @dp.message(CommandStart())
-async def start(message:Message):
+async def start(message: Message):
     if not await check_subscription(message.from_user.id):
         await message.answer("❌ لازم تدخل كود اشتراك\n/code XXXXX")
         return
-    await message.answer("اختر رقم الورقة:",reply_markup=ranks_kb())
+    mode = user_temp.get(message.from_user.id, {}).get("mode","guess_only")
+    if mode=="training":
+        await message.answer("🧠 وضع التدريب مفعل. اختر رقم الورقة:", reply_markup=ranks_kb())
+    else:
+        await message.answer("🎲 التخمين العادي. اختر رقم الورقة:", reply_markup=ranks_kb())
+
+# ================= USE CODE =================
+@dp.message(commands=["code"])
+async def use_code(message: Message):
+    parts = message.text.split()
+    if len(parts)!=2:
+        await message.answer("استخدم:\n/code XXXXX")
+        return
+    code = parts[1].upper()
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT days,plan,type,used FROM codes WHERE code=$1", code)
+        if not row or row["used"]:
+            await message.answer("❌ كود غير صالح أو مستخدم")
+            return
+        await conn.execute("UPDATE codes SET used=TRUE WHERE code=$1", code)
+        await activate_user(message.from_user.id, row["days"], row["plan"], type=row["type"])
+        if row["type"]=="trainer":
+            await message.answer(f"🔥 تم تفعيلك كمدرب\n💎 خطتك: {row['plan']}")
+        else:
+            await message.answer(f"🔥 تم التفعيل\n💎 خطتك: {row['plan']}")
+
+# ================= ADMIN COMMANDS =================
+@dp.message(commands=["admin"])
+async def admin_guess_mode(message: Message):
+    parts = message.text.split()
+    if message.from_user.id not in [ADMIN_ID] + TRAINER_IDS:
+        return
+    if len(parts)==2 and parts[1].lower()=="king":
+        user_temp[message.from_user.id]={"mode":"guess_only"}
+        await message.answer("🎲 وضع التخمين مفعل. اختر رقم الورقة:", reply_markup=ranks_kb())
+    else:
+        await message.answer("❌ الأمر غير صالح")
+
+@dp.message(commands=["train"])
+async def admin_train_mode(message: Message):
+    if message.from_user.id not in [ADMIN_ID] + TRAINER_IDS:
+        return
+    user_temp[message.from_user.id]={"mode":"training"}
+    await message.answer("🧠 وضع التدريب مفعل. اختر رقم الورقة لتدريب البوت:", reply_markup=ranks_kb())
 
 # ================= CALLBACKS =================
 @dp.callback_query(lambda c:c.data.startswith("rank_"))
 async def choose_rank(callback:CallbackQuery):
     try:
         await callback.answer()
-        user_temp[callback.from_user.id]={"rank":callback.data.split("_")[1]}
+        user_temp[callback.from_user.id]["rank"]=callback.data.split("_")[1]
         await callback.message.edit_text("اختر النوع:",reply_markup=suits_kb())
-    except Exception as e:
-        logging.error(f"Error choose_rank: {e}")
+    except: pass
 
 @dp.callback_query(lambda c:c.data.startswith("suit_"))
 async def choose_suit(callback:CallbackQuery):
@@ -207,53 +228,56 @@ async def choose_suit(callback:CallbackQuery):
         await callback.answer()
         user_temp[callback.from_user.id]["suit"]=callback.data.split("_")[1]
         await callback.message.edit_text("اختر الضربة السابقة:", reply_markup=prev_hands_kb())
-    except Exception as e:
-        logging.error(f"Error choose_suit: {e}")
+    except: pass
 
 @dp.callback_query(lambda c:c.data.startswith("prev_"))
 async def handle_prev(callback:CallbackQuery):
+    user_id = callback.from_user.id
     try:
         await callback.answer()
-        user_id = callback.from_user.id
-        if not await check_subscription(user_id):
-            await callback.message.edit_text("❌ الاشتراك منتهي")
-            return
-
-        prev = callback.data.replace("prev_","")
         data = user_temp.get(user_id)
         if not data:
-            await callback.message.edit_text("ابدأ من جديد /start")
+            await callback.message.answer("ابدأ من جديد /start")
             return
-
-        user_temp[user_id]["prev"] = prev
+        prev = callback.data.replace("prev_","")
+        user_temp[user_id]["prev"]=prev
 
         left_pred, left_conf = await predict_hand("left", data["rank"], data["suit"], prev, LEFT_HANDS)
         right_pred, right_conf = await predict_hand("right", data["rank"], data["suit"], prev, RIGHT_HANDS)
 
-        await callback.message.edit_text(
-            f"⬅️ يسار: {LEFT_HANDS_LABELS.get(left_pred,left_pred)} ({left_conf}%)\n"
-            f"➡️ يمين: {RIGHT_HANDS_LABELS.get(right_pred,right_pred)} ({right_conf}%)",
-            reply_markup=next_guess_kb()
-        )
-    except Exception as e:
-        logging.error(f"Error handle_prev: {e}")
-        await callback.message.answer("حدث خطأ، حاول مرة أخرى /start")
+        mode = data.get("mode","guess_only")
+        if mode=="training":
+            # تدريب الذكاء الاصطناعي
+            await train_ai("left", data["rank"], data["suit"], prev, left_pred)
+            await train_ai("right", data["rank"], data["suit"], prev, right_pred)
+
+        try:
+            await callback.message.edit_text(
+                f"⬅️ يسار: {LEFT_HANDS_LABELS.get(left_pred,left_pred)} ({left_conf}%)\n"
+                f"➡️ يمين: {RIGHT_HANDS_LABELS.get(right_pred,right_pred)} ({right_conf}%)",
+                reply_markup=next_guess_kb()
+            )
+        except:
+            await callback.message.answer(
+                f"⬅️ يسار: {LEFT_HANDS_LABELS.get(left_pred,left_pred)} ({left_conf}%)\n"
+                f"➡️ يمين: {RIGHT_HANDS_LABELS.get(right_pred,right_pred)} ({right_conf}%)",
+                reply_markup=next_guess_kb()
+            )
+    except: pass
 
 @dp.callback_query(lambda c:c.data=="next_guess")
 async def next_guess(callback:CallbackQuery):
+    user_temp.pop(callback.from_user.id, None)
     try:
         await callback.answer()
-        user_temp.pop(callback.from_user.id, None)
         await callback.message.edit_text("ابدأ التخمين الجديد:", reply_markup=ranks_kb())
-    except Exception as e:
-        logging.error(f"Error next_guess: {e}")
-        await callback.message.answer("حدث خطأ، حاول مرة أخرى /start")
+    except:
+        await callback.message.answer("ابدأ التخمين الجديد:", reply_markup=ranks_kb())
 
 # ================= WEBHOOK =================
 async def main():
     logging.basicConfig(level=logging.INFO)
     await init_db()
-    asyncio.create_task(send_alerts())
     await bot.delete_webhook(drop_pending_updates=True)
     app=web.Application()
     SimpleRequestHandler(dispatcher=dp,bot=bot).register(app,path=WEBHOOK_PATH)
