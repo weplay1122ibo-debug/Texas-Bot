@@ -1,8 +1,13 @@
-[project]
-name = "texas-bot"
-version = "0.1.0"
-requires-python = ">=3.11"
+# nixpacks.toml
 
-[build-system]
-requires = ["setuptools>=45", "wheel"]
-build-backend = "setuptools.build_meta"
+[phases.setup]
+nixPkgs = ['python311', 'python311Packages.pip', 'gcc']
+
+[phases.build]
+cmds = [
+  'python3.11 -m pip install --upgrade pip wheel setuptools',
+  'python3.11 -m pip install -r requirements.txt --no-cache-dir --prefer-binary'
+]
+
+[start]
+cmd = "python3.11 bot.py"
