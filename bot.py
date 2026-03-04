@@ -22,9 +22,16 @@ dp = Dispatcher()
 db_pool = None
 user_temp = {}
 
-# مطابق للعبة بالصورة
-HANDS = [
+# ================= GAME HANDS =================
+
+LEFT_HANDS = [
+    "♠️ متتالية من نفس النوع",
     "👥 زوج",
+    "🅰️ AA"
+]
+
+RIGHT_HANDS = [
+    "👥 زوجين",
     "🔗 متتالية",
     "🎴 ثلاثة",
     "🏠 فل هاوس",
@@ -32,6 +39,7 @@ HANDS = [
 ]
 
 # ================= DATABASE =================
+
 async def init_db():
     global db_pool
     db_pool = await asyncpg.create_pool(DATABASE_URL, ssl="require")
@@ -67,6 +75,7 @@ async def init_db():
         """)
 
 # ================= SUBSCRIPTION =================
+
 async def check_subscription(user_id):
     if user_id == ADMIN_ID:
         return True
@@ -82,18 +91,28 @@ async def check_subscription(user_id):
 
     return row["expire"] > datetime.now()
 
-async def activate_user(user_id, days, plan):
-    expire = datetime.now() + timedelta(days=days)
 
+async def activate_user(user_id, days, plan):
     async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT expire FROM users WHERE user_id=$1",
+            str(user_id)
+        )
+
+        if row and row["expire"] > datetime.now():
+            new_expire = row["expire"] + timedelta(days=days)
+        else:
+            new_expire = datetime.now() + timedelta(days=days)
+
         await conn.execute("""
             INSERT INTO users (user_id, expire, plan)
             VALUES ($1,$2,$3)
             ON CONFLICT (user_id)
             DO UPDATE SET expire=$2, plan=$3
-        """, str(user_id), expire, plan)
+        """, str(user_id), new_expire, plan)
 
-# ================= ADMIN =================
+# ================= ADMIN COMMANDS =================
+
 @dp.message(Command("create_code"))
 async def create_code(message: Message):
     if message.from_user.id != ADMIN_ID:
@@ -109,12 +128,40 @@ async def create_code(message: Message):
     code = secrets.token_hex(4).upper()
 
     async with db_pool.acquire() as conn:
-        await conn.execute("""
-            INSERT INTO codes (code, days, plan)
-            VALUES ($1,$2,$3)
-        """, code, days, plan)
+        await conn.execute(
+            "INSERT INTO codes (code, days, plan) VALUES ($1,$2,$3)",
+            code, days, plan
+        )
 
-    await message.answer(f"✅ كود جديد:\n{code}\n\n📅 {days} يوم\n💎 الخطة: {plan}")
+    await message.answer(f"✅ كود:\n{code}")
+
+
+@dp.message(Command("delete_code"))
+async def delete_code(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    parts = message.text.split()
+    if len(parts) != 2:
+        await message.answer("استخدم:\n/delete_code CODE")
+        return
+
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM codes WHERE code=$1", parts[1].upper())
+
+    await message.answer("✅ تم حذف الكود")
+
+
+@dp.message(Command("reset_training"))
+async def reset_training(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    async with db_pool.acquire() as conn:
+        await conn.execute("TRUNCATE training")
+
+    await message.answer("🧠 تم تصفير التدريب")
+
 
 @dp.message(Command("stats"))
 async def stats(message: Message):
@@ -126,15 +173,12 @@ async def stats(message: Message):
         training = await conn.fetchval("SELECT COUNT(*) FROM training")
 
     await message.answer(
-        f"""
-🇮🇶 Texas Iraq Bot - Stats
-
-👥 المشتركين: {users}
-🧠 بيانات التدريب: {training}
-"""
+        f"👥 المشتركين: {users}\n🧠 بيانات التدريب: {training}"
     )
 
+
 # ================= USE CODE =================
+
 @dp.message(Command("code"))
 async def use_code(message: Message):
     parts = message.text.split()
@@ -145,21 +189,23 @@ async def use_code(message: Message):
     code = parts[1].upper()
 
     async with db_pool.acquire() as conn:
-        row = await conn.fetchrow("""
-            SELECT days, plan FROM codes
-            WHERE code=$1 AND used=FALSE
-        """, code)
+        row = await conn.fetchrow(
+            "SELECT days, plan FROM codes WHERE code=$1 AND used=FALSE",
+            code
+        )
 
         if not row:
-            await message.answer("❌ كود غير صالح أو مستخدم")
+            await message.answer("❌ كود غير صالح")
             return
 
         await conn.execute("UPDATE codes SET used=TRUE WHERE code=$1", code)
 
     await activate_user(message.from_user.id, row["days"], row["plan"])
-    await message.answer(f"🔥 تم التفعيل\n💎 خطتك: {row['plan']}")
+    await message.answer("🔥 تم التفعيل")
+
 
 # ================= AI =================
+
 async def train_ai(side, rank, suit, prev, result):
     async with db_pool.acquire() as conn:
         await conn.execute("""
@@ -167,16 +213,16 @@ async def train_ai(side, rank, suit, prev, result):
             VALUES ($1,$2,$3,$4,$5)
         """, side, rank, suit, prev, result)
 
-async def predict_hand(side, rank, suit, prev):
-    scores = {h: 0 for h in HANDS}
+
+async def predict_hand(side, rank, suit, prev, hands_list):
+    scores = {h: 0 for h in hands_list}
     total = 0
 
     async with db_pool.acquire() as conn:
-        rows = await conn.fetch("""
-            SELECT rank, suit, prev, result
-            FROM training
-            WHERE side=$1
-        """, side)
+        rows = await conn.fetch(
+            "SELECT rank, suit, prev, result FROM training WHERE side=$1",
+            side
+        )
 
     for r in rows:
         weight = 0
@@ -188,10 +234,9 @@ async def predict_hand(side, rank, suit, prev):
         if r["prev"] == prev:
             weight += 5
 
-        if weight > 0:
-            if r["result"] in scores:
-                scores[r["result"]] += weight
-                total += weight
+        if weight > 0 and r["result"] in scores:
+            scores[r["result"]] += weight
+            total += weight
 
     if total == 0:
         return "لا يوجد بيانات", 0
@@ -201,7 +246,9 @@ async def predict_hand(side, rank, suit, prev):
 
     return best, confidence
 
+
 # ================= KEYBOARDS =================
+
 def ranks_kb():
     ranks = ["A","K","Q","J","10","9","8","7","6","5","4","3","2"]
     rows = [ranks[i:i+4] for i in range(0, len(ranks), 4)]
@@ -212,6 +259,7 @@ def ranks_kb():
         ]
     )
 
+
 def suits_kb():
     suits = ["♥️","♦️","♣️","♠️"]
     return InlineKeyboardMarkup(
@@ -220,22 +268,25 @@ def suits_kb():
         ]
     )
 
-def hands_kb(prefix):
+
+def hands_kb(prefix, hands_list):
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text=h, callback_data=f"{prefix}_{h}")]
-            for h in HANDS
+            for h in hands_list
         ]
     )
 
-# ================= FLOW =================
+# ================= GAME FLOW =================
+
 @dp.message(CommandStart())
 async def start(message: Message):
     if not await check_subscription(message.from_user.id):
-        await message.answer("❌ لازم تدخل كود اشتراك\n/code XXXXX")
+        await message.answer("❌ لازم كود اشتراك\n/code XXXXX")
         return
 
-    await message.answer("🇮🇶 Texas Iraq Bot\n\nاختر رقم الورقة:", reply_markup=ranks_kb())
+    await message.answer("اختر رقم الورقة:", reply_markup=ranks_kb())
+
 
 @dp.callback_query(lambda c: c.data.startswith("rank_"))
 async def choose_rank(callback: CallbackQuery):
@@ -243,11 +294,16 @@ async def choose_rank(callback: CallbackQuery):
     user_temp[callback.from_user.id] = {"rank": callback.data.split("_")[1]}
     await callback.message.edit_text("اختر النوع:", reply_markup=suits_kb())
 
+
 @dp.callback_query(lambda c: c.data.startswith("suit_"))
 async def choose_suit(callback: CallbackQuery):
     await callback.answer()
     user_temp[callback.from_user.id]["suit"] = callback.data.split("_")[1]
-    await callback.message.edit_text("الضربة السابقة:", reply_markup=hands_kb("prev"))
+    await callback.message.edit_text(
+        "الضربة السابقة:",
+        reply_markup=hands_kb("prev", RIGHT_HANDS)
+    )
+
 
 @dp.callback_query(lambda c: c.data.startswith("prev_"))
 async def handle_prev(callback: CallbackQuery):
@@ -261,62 +317,59 @@ async def handle_prev(callback: CallbackQuery):
     prev = callback.data.replace("prev_", "")
     data = user_temp.get(user_id)
 
-    if not data:
-        await callback.message.edit_text("ابدأ من جديد /start")
-        return
+    left_pred, left_conf = await predict_hand(
+        "left", data["rank"], data["suit"], prev, LEFT_HANDS
+    )
 
-    left_pred, left_conf = await predict_hand("left", data["rank"], data["suit"], prev)
-    right_pred, right_conf = await predict_hand("right", data["rank"], data["suit"], prev)
+    right_pred, right_conf = await predict_hand(
+        "right", data["rank"], data["suit"], prev, RIGHT_HANDS
+    )
 
     if user_id == ADMIN_ID:
         user_temp[user_id]["prev"] = prev
         await callback.message.edit_text(
-            f"""
-🇮🇶 Texas Iraq Bot
-
-⬅️ يسار: {left_pred} ({left_conf}%)
-➡️ يمين: {right_pred} ({right_conf}%)
-
-ادخل نتيجة اليسار:
-""",
-            reply_markup=hands_kb("train_left")
+            f"⬅️ يسار: {left_pred} ({left_conf}%)\n"
+            f"➡️ يمين: {right_pred} ({right_conf}%)\n\n"
+            f"ادخل نتيجة اليسار:",
+            reply_markup=hands_kb("train_left", LEFT_HANDS)
         )
     else:
         await callback.message.edit_text(
-            f"""
-🇮🇶 Texas Iraq Bot
-
-⬅️ يسار: {left_pred}
-📊 الثقة: {left_conf}%
-
-➡️ يمين: {right_pred}
-📊 الثقة: {right_conf}%
-"""
+            f"⬅️ يسار: {left_pred} ({left_conf}%)\n"
+            f"➡️ يمين: {right_pred} ({right_conf}%)"
         )
+
 
 @dp.callback_query(lambda c: c.data.startswith("train_left_"))
 async def train_left(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         return
     await callback.answer()
+
     user_temp[ADMIN_ID]["left"] = callback.data.replace("train_left_", "")
-    await callback.message.edit_text("ادخل نتيجة اليمين:", reply_markup=hands_kb("train_right"))
+    await callback.message.edit_text(
+        "ادخل نتيجة اليمين:",
+        reply_markup=hands_kb("train_right", RIGHT_HANDS)
+    )
+
 
 @dp.callback_query(lambda c: c.data.startswith("train_right_"))
 async def train_right(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         return
     await callback.answer()
+
     right = callback.data.replace("train_right_", "")
     data = user_temp[ADMIN_ID]
 
     await train_ai("left", data["rank"], data["suit"], data["prev"], data["left"])
     await train_ai("right", data["rank"], data["suit"], data["prev"], right)
 
-    await callback.message.edit_text("✅ تم تدريب الذكاء بنجاح")
+    await callback.message.edit_text("✅ تم التدريب بنجاح")
     user_temp.pop(ADMIN_ID, None)
 
 # ================= WEBHOOK =================
+
 async def main():
     logging.basicConfig(level=logging.INFO)
     await init_db()
@@ -337,6 +390,7 @@ async def main():
     await bot.set_webhook(webhook_base.rstrip("/") + WEBHOOK_PATH)
 
     await asyncio.Event().wait()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
