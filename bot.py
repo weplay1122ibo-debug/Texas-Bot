@@ -70,12 +70,14 @@ async def auto_save():
 def get_training_count():
     return len(AI_MEMORY)
 
+def get_training_percentage():
+    return min(100, int((get_training_count() / 20000) * 100))
+
 def train_ai(rank, suit, prev, curr):
     AI_MEMORY.appendleft({
         "rank": rank, "suit": suit, "prev": prev, "curr": curr,
         "time": datetime.now().isoformat()
     })
-    save_training()   # ← حفظ فوري بعد كل تدريب
 
 def predict_hand(rank, suit, last_hand=None):
     hands = ["👥 زوجين", "🔗 متتالية", "🎴 ثلاثة", "♠️ فلش", "🏠 فل هاوس", "🂡 أربعة", "🌟 ستريت فلش"]
@@ -107,7 +109,7 @@ def predict_hand(rank, suit, last_hand=None):
 
     return text, high[0]
 
-# ================= باقي الكود (نفس السابق مع التعديلات الاحترافية) =================
+# ================= SUBSCRIPTION & ADMIN =================
 def generate_code():
     return ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
 
@@ -126,7 +128,6 @@ def activate_code(user_id, code):
     save_json(CODES_FILE, codes)
     return True, "✅ تم التفعيل!\nجاهز للعب فوراً 🔥"
 
-# ADMIN COMMANDS
 @dp.message(lambda m: m.text and m.text.startswith("/addcode"))
 async def add_code(message: Message):
     if message.from_user.id != ADMIN_ID: return
@@ -165,10 +166,41 @@ async def revoke_subscription(message: Message):
 async def train_status(message: Message):
     if message.from_user.id != ADMIN_ID: return
     count = get_training_count()
-    perc = min(100, int((count / 20000) * 100))
-    await message.answer(f"📊 حالة تدريب البوت\n\nجولات مدربة: **{count}**\nنسبة التدريب: **{perc}%**")
+    perc = get_training_percentage()
+    await message.answer(f"📊 حالة تدريب البوت\n\n"
+                         f"جولات مدربة: **{count}**\n"
+                         f"نسبة التدريب: **{perc}%**")
 
-# FLOW + حفظ فوري
+@dp.message(Command("stats"))
+async def show_stats(message: Message):
+    if message.from_user.id != ADMIN_ID: return
+    today_key = datetime.now().strftime("%Y-%m-%d")
+    today = daily_stats.get(today_key, {"total": 0, "correct": 0})
+    t_perc = round(today["correct"] / today["total"] * 100, 1) if today["total"] else 0
+    all_total = sum(d.get("total", 0) for d in daily_stats.values())
+    all_correct = sum(d.get("correct", 0) for d in daily_stats.values())
+    o_perc = round(all_correct / all_total * 100, 1) if all_total else 0
+
+    await message.answer(f"📊 إحصائيات TEXAS AI V8\n\n"
+                         f"📅 اليوم: {t_perc}%\n"
+                         f"📈 الإجمالي: {o_perc}%\n"
+                         f"🧠 جولات التدريب: {get_training_count()}")
+
+# ================= KEYBOARDS =================
+def ranks_kb():
+    ranks = ["A","K","Q","J","10","9","8","7","6","5","4","3","2"]
+    rows = [ranks[i:i+4] for i in range(0, len(ranks), 4)]
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=r, callback_data=f"rank_{r}") for r in row] for row in rows])
+
+def suits_kb():
+    suits = ["♥️","♦️","♣️","♠️"]
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=s, callback_data=f"suit_{s}") for s in suits]])
+
+def hands_kb():
+    hands = ["👥 زوجين", "🔗 متتالية", "🎴 ثلاثة", "♠️ فلش", "🏠 فل هاوس", "🂡 أربعة", "🌟 ستريت فلش"]
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=h, callback_data=f"hand_{h}")] for h in hands])
+
+# ================= FLOW =================
 @dp.message(CommandStart())
 async def start(message: Message):
     await message.answer("🔥 TEXAS AI V8\nادخل كود الاشتراك")
@@ -234,7 +266,7 @@ async def handle_hand(callback: CallbackQuery):
         else:
             status = f"❌ التخمين كان: {predicted_high}\nالفعلي: {actual}\n\nاكتب `تم` للاستمرار"
 
-        train_ai(rank, suit, prev, actual)   # ← حفظ فوري
+        train_ai(rank, suit, prev, actual)
         save_daily_stats()
 
         await callback.message.edit_text(status)
