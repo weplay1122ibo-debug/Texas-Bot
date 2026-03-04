@@ -147,8 +147,10 @@ def suits_kb():
     suits=["♥️","♦️","♣️","♠️"]
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=s,callback_data=f"suit_{s}") for s in suits]])
 
-def hands_kb(prefix,hands_list):
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=h,callback_data=f"{prefix}_{h}")] for h in hands_list])
+def prev_hands_kb():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text=h,callback_data=f"prev_{h}")] for h in RIGHT_HANDS]
+    )
 
 def next_guess_kb():
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 التخمين التالي",callback_data="next_guess")]])
@@ -200,91 +202,31 @@ async def choose_rank(callback:CallbackQuery):
 async def choose_suit(callback:CallbackQuery):
     await callback.answer()
     user_temp[callback.from_user.id]["suit"]=callback.data.split("_")[1]
-    await callback.message.edit_text("الضربة السابقة:",reply_markup=hands_kb("prev",RIGHT_HANDS))
+    await callback.message.edit_text("اختر الضربة السابقة:", reply_markup=prev_hands_kb())
 
 @dp.callback_query(lambda c:c.data.startswith("prev_"))
 async def handle_prev(callback:CallbackQuery):
     await callback.answer()
-    user_id=callback.from_user.id
+    user_id = callback.from_user.id
     if not await check_subscription(user_id):
         await callback.message.edit_text("❌ الاشتراك منتهي")
         return
-    prev=callback.data.replace("prev_","")
-    data=user_temp.get(user_id)
-    left_pred,left_conf=await predict_hand("left",data["rank"],data["suit"],prev,LEFT_HANDS)
-    right_pred,right_conf=await predict_hand("right",data["rank"],data["suit"],prev,RIGHT_HANDS)
-    await callback.message.edit_text(f"⬅️ يسار: {left_pred} ({left_conf}%)\n➡️ يمين: {right_pred} ({right_conf}%)",reply_markup=next_guess_kb())
+    prev = callback.data.replace("prev_","")
+    data = user_temp.get(user_id)
+    if not data:
+        await callback.message.edit_text("ابدأ من جديد /start")
+        return
+    left_pred,left_conf = await predict_hand("left", data["rank"], data["suit"], prev, LEFT_HANDS)
+    right_pred,right_conf = await predict_hand("right", data["rank"], data["suit"], prev, RIGHT_HANDS)
+    await callback.message.edit_text(
+        f"⬅️ يسار: {left_pred} ({left_conf}%)\n➡️ يمين: {right_pred} ({right_conf}%)",
+        reply_markup=next_guess_kb()
+    )
 
 @dp.callback_query(lambda c:c.data=="next_guess")
 async def next_guess(callback:CallbackQuery):
     await callback.answer()
     await callback.message.edit_text("ابدأ التخمين الجديد:",reply_markup=ranks_kb())
-
-# ================= AI_STATS =================
-@dp.message(Command("ai_stats"))
-async def ai_stats(message:Message):
-    user_id=message.from_user.id
-    if user_id != ADMIN_ID and user_id not in TRAINER_IDS:
-        await message.answer("❌ هذا الأمر خاص بالأدمن والمدربين فقط")
-        return
-    await message.answer("اختر القسم الذي تريد تحليله:", reply_markup=admin_stats_kb())
-
-async def analyze_side(side):
-    async with db_pool.acquire() as conn:
-        data = await conn.fetch("SELECT result FROM training WHERE side=$1",side)
-    total=len(data)
-    counts={}
-    confidence_sum=0
-    for row in data:
-        results=row["result"].split(",")
-        for res in results: counts[res]=counts.get(res,0)+1
-        confidence_sum+=100/len(results) if results else 0
-    best=max(counts,key=counts.get) if counts else "لا يوجد"
-    avg_conf=int(confidence_sum/total) if total>0 else 0
-    return f"📊 تحليل أداء الذكاء - {side.capitalize()}\nعدد التخمينات: {total}\nأفضل نتيجة متوقعة: {best}\nمتوسط نسبة الثقة: {avg_conf}%"
-
-@dp.callback_query(lambda c:c.data.startswith("ai_"))
-async def ai_callbacks(callback:CallbackQuery):
-    await callback.answer()
-    side=callback.data.replace("ai_","")
-    if side=="all":
-        left=await analyze_side("left")
-        right=await analyze_side("right")
-        text=f"{left}\n{right}"
-    else:
-        text=await analyze_side(side)
-    await callback.message.edit_text(text)
-
-# ================= TRAINING_STATS =================
-@dp.message(Command("training_stats"))
-async def training_stats(message:Message):
-    user_id=message.from_user.id
-    if user_id != ADMIN_ID and user_id not in TRAINER_IDS:
-        await message.answer("❌ هذا الأمر خاص بالأدمن والمدربين فقط")
-        return
-    async with db_pool.acquire() as conn:
-        left_count = await conn.fetchval("SELECT COUNT(*) FROM training WHERE side='left'")
-        right_count = await conn.fetchval("SELECT COUNT(*) FROM training WHERE side='right'")
-        total = left_count + right_count
-    text=f"""
-📊 **إحصائيات التدريب**
-
-✅ إجمالي عدد الضربات المدربة: {total}
-⬅️ يسار: {left_count}
-➡️ يمين: {right_count}
-"""
-    await message.answer(text)
-
-# ================= STATS =================
-@dp.message(Command("stats"))
-async def stats(message:Message):
-    user_id = message.from_user.id
-    if user_id != ADMIN_ID:
-        return
-    async with db_pool.acquire() as conn:
-        users = await conn.fetchval("SELECT COUNT(*) FROM users")
-        training = await conn.fetchval("SELECT COUNT(*) FROM training")
-    await message.answer(f"🇮🇶 Texas Iraq Bot - Stats\n👥 المشتركين: {users}\n🧠 بيانات التدريب: {training}")
 
 # ================= WEBHOOK =================
 async def main():
