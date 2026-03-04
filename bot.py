@@ -11,7 +11,7 @@ from aiohttp import web
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 # ================== CONFIG ==================
-API_TOKEN = "PUT_YOUR_TOKEN"
+API_TOKEN = "8664632562:AAHD6xaPk01W7cfX1zADS8hRwh-mfVW7s4k"
 ADMIN_ID = 7717061636
 
 WEBHOOK_PATH = "/webhook"
