@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "texas_bot"
 version = "1.0.0"
 description = "Telegram bot ذكي لخماسي"
-authors = [{name="Breath", email=""}]
+authors = [{name="Breath", email="ialzanaganwi@icloud.com"}]
 
 dependencies = [
     "aiogram>=3.1.0,<3.2.0",
