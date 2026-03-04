@@ -70,29 +70,32 @@ async def auto_save():
 def get_training_count():
     return len(AI_MEMORY)
 
-def get_training_percentage():
-    return min(100, int((get_training_count() / 20000) * 100))
-
-def train_ai(rank, suit, prev, curr):
+def train_ai(rank, suit, prev, curr, day=None, hour=None):
     AI_MEMORY.appendleft({
-        "rank": rank, "suit": suit, "prev": prev, "curr": curr,
+        "rank": rank,
+        "suit": suit,
+        "prev": prev,
+        "curr": curr,
+        "day": day,
+        "hour": hour,
         "time": datetime.now().isoformat()
     })
+    save_training()  # حفظ فوري
 
-def predict_hand(rank, suit, last_hand=None):
+def predict_hand(rank, suit, last_hand=None, day=None, hour=None):
     hands = ["👥 زوجين", "🔗 متتالية", "🎴 ثلاثة", "♠️ فلش", "🏠 فل هاوس", "🂡 أربعة", "🌟 ستريت فلش"]
     scores = {h: 3 for h in hands}
 
     now = datetime.now()
-    for item in list(AI_MEMORY)[:500]:
+    for item in list(AI_MEMORY)[:600]:
         created = datetime.fromisoformat(item["time"])
         days_old = (now - created).days
-        time_weight = 5 if days_old <= 3 else 3 if days_old <= 7 else 1
+        time_weight = 6 if days_old <= 2 else 4 if days_old <= 7 else 1
 
         if item["rank"] == rank and item["suit"] == suit:
-            scores[item["curr"]] += 12 * time_weight
+            scores[item["curr"]] += 15 * time_weight
         if last_hand and item["prev"] == last_hand:
-            scores[item["curr"]] += 8 * time_weight
+            scores[item["curr"]] += 10 * time_weight
         scores[item["curr"]] += 1
 
     total = sum(scores.values())
@@ -109,7 +112,7 @@ def predict_hand(rank, suit, last_hand=None):
 
     return text, high[0]
 
-# ================= SUBSCRIPTION & ADMIN =================
+# ================= SUBSCRIPTION =================
 def generate_code():
     return ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
 
@@ -126,8 +129,9 @@ def activate_code(user_id, code):
     codes[code]["used"] = True
     save_json(USERS_FILE, users)
     save_json(CODES_FILE, codes)
-    return True, "✅ تم التفعيل!\nجاهز للعب فوراً 🔥"
+    return True, "✅ تم التفعيل بنجاح!\nجاهز للعب"
 
+# ================= ADMIN =================
 @dp.message(lambda m: m.text and m.text.startswith("/addcode"))
 async def add_code(message: Message):
     if message.from_user.id != ADMIN_ID: return
@@ -136,40 +140,14 @@ async def add_code(message: Message):
     code = generate_code()
     codes[code] = {"used": False, "days": days}
     save_json(CODES_FILE, codes)
-    await message.answer(f"✅ كود جديد تم إنشاؤه!\n\n`{code}`\nالمدة: {days} يوم", parse_mode="Markdown")
-
-@dp.message(Command("users"))
-async def show_subscribers(message: Message):
-    if message.from_user.id != ADMIN_ID: return
-    active = {uid: data for uid, data in users.items() if datetime.fromisoformat(data) > datetime.now()}
-    text = f"👥 عدد المشتركين النشطين: **{len(active)}**\n\n"
-    for uid, expire in active.items():
-        exp = datetime.fromisoformat(expire).strftime("%Y-%m-%d")
-        text += f"• `{uid}` → {exp}\n"
-    await message.answer(text or "لا يوجد مشتركين حالياً")
-
-@dp.message(Command("revoke"))
-async def revoke_subscription(message: Message):
-    if message.from_user.id != ADMIN_ID: return
-    try:
-        target = int(message.text.split()[1])
-        if str(target) in users:
-            del users[str(target)]
-            save_json(USERS_FILE, users)
-            await message.answer(f"✅ تم إنهاء اشتراك `{target}`")
-        else:
-            await message.answer("❌ المستخدم غير موجود")
-    except:
-        await message.answer("استخدام: `/revoke 123456789`")
+    await message.answer(f"✅ كود جديد:\n`{code}`\nالمدة: {days} يوم", parse_mode="Markdown")
 
 @dp.message(Command("trainstatus"))
 async def train_status(message: Message):
     if message.from_user.id != ADMIN_ID: return
     count = get_training_count()
-    perc = get_training_percentage()
-    await message.answer(f"📊 حالة تدريب البوت\n\n"
-                         f"جولات مدربة: **{count}**\n"
-                         f"نسبة التدريب: **{perc}%**")
+    perc = min(100, int(count / 20000 * 100))
+    await message.answer(f"📊 حالة تدريب البوت\nجولات مدربة: {count}\nنسبة الذكاء: {perc}%")
 
 @dp.message(Command("stats"))
 async def show_stats(message: Message):
@@ -181,10 +159,7 @@ async def show_stats(message: Message):
     all_correct = sum(d.get("correct", 0) for d in daily_stats.values())
     o_perc = round(all_correct / all_total * 100, 1) if all_total else 0
 
-    await message.answer(f"📊 إحصائيات TEXAS AI V8\n\n"
-                         f"📅 اليوم: {t_perc}%\n"
-                         f"📈 الإجمالي: {o_perc}%\n"
-                         f"🧠 جولات التدريب: {get_training_count()}")
+    await message.answer(f"📊 إحصائيات\nاليوم: {t_perc}%\nالإجمالي: {o_perc}%\nجولات التدريب: {get_training_count()}")
 
 # ================= KEYBOARDS =================
 def ranks_kb():
@@ -200,7 +175,11 @@ def hands_kb():
     hands = ["👥 زوجين", "🔗 متتالية", "🎴 ثلاثة", "♠️ فلش", "🏠 فل هاوس", "🂡 أربعة", "🌟 ستريت فلش"]
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=h, callback_data=f"hand_{h}")] for h in hands])
 
-# ================= FLOW =================
+def days_kb():
+    days = ["السبت", "الأحد", "الاثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة"]
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=d, callback_data=f"day_{d}") for d in days]])
+
+# ================= FLOW - التسلسل الجديد =================
 @dp.message(CommandStart())
 async def start(message: Message):
     await message.answer("🔥 TEXAS AI V8\nادخل كود الاشتراك")
@@ -208,38 +187,58 @@ async def start(message: Message):
 @dp.message()
 async def handle_text(message: Message):
     user_id = message.from_user.id
+
     if not check_subscription(user_id):
         ok, msg = activate_code(user_id, message.text.strip())
         await message.answer(msg)
         if ok:
-            await message.answer("اختر رقم الورقة:", reply_markup=ranks_kb())
+            user_temp[user_id] = {"step": "time"}
+            await message.answer("⏰ ما هي الساعة الحالية بالضبط؟ (مثال: 14:30)")
         return
+
+    # تسلسل الخطوات
+    state = user_temp.get(user_id, {})
+
+    if state.get("step") == "time":
+        user_temp[user_id]["time"] = message.text
+        user_temp[user_id]["step"] = "day"
+        await message.answer("📅 ما هو اليوم في الأسبوع؟", reply_markup=days_kb())
+        return
+
     await message.answer("اختر رقم الورقة:", reply_markup=ranks_kb())
+
+# Callback Handlers
+@dp.callback_query(lambda c: c.data.startswith("day_"))
+async def choose_day(callback: CallbackQuery):
+    await callback.answer()
+    user_id = callback.from_user.id
+    day = callback.data.replace("day_", "")
+    user_temp[user_id]["day"] = day
+    user_temp[user_id]["step"] = "rank"
+    await callback.message.edit_text("اختر رقم الورقة:", reply_markup=ranks_kb())
 
 @dp.callback_query(lambda c: c.data.startswith("rank_"))
 async def choose_rank(callback: CallbackQuery):
     await callback.answer()
-    user_temp[callback.from_user.id] = user_temp.get(callback.from_user.id, {})
-    user_temp[callback.from_user.id]["rank"] = callback.data.split("_")[1]
-    await callback.message.edit_text("اختر النوع:", reply_markup=suits_kb())
+    user_id = callback.from_user.id
+    user_temp[user_id]["rank"] = callback.data.split("_")[1]
+    user_temp[user_id]["step"] = "suit"
+    await callback.message.edit_text("اختر نوع الورقة:", reply_markup=suits_kb())
 
 @dp.callback_query(lambda c: c.data.startswith("suit_"))
 async def choose_suit(callback: CallbackQuery):
     await callback.answer()
-    data = user_temp.get(callback.from_user.id, {})
-    if not data or "rank" not in data:
-        await callback.message.edit_text("ابدأ من جديد")
-        return
-    data["suit"] = callback.data.split("_")[1]
-    await callback.message.edit_text("الضربة السابقة؟ (اختياري)", reply_markup=hands_kb())
+    user_id = callback.from_user.id
+    user_temp[user_id]["suit"] = callback.data.split("_")[1]
+    user_temp[user_id]["step"] = "prev"
+    await callback.message.edit_text("الضربة السابقة؟", reply_markup=hands_kb())
 
 @dp.callback_query(lambda c: c.data.startswith("hand_"))
 async def handle_hand(callback: CallbackQuery):
     await callback.answer()
     user_id = callback.from_user.id
-    data = user_temp.get(user_id)
+    data = user_temp.get(user_id, {})
     if not data:
-        await callback.answer("الجلسة انتهت، ابدأ من جديد", show_alert=True)
         return
 
     chosen = callback.data.replace("hand_", "")
@@ -247,46 +246,14 @@ async def handle_hand(callback: CallbackQuery):
 
     rank = data.get("rank")
     suit = data.get("suit")
-    if not rank or not suit: return
+    prev = chosen
+    day = data.get("day")
+    hour = data.get("time")
 
-    if data.get("mode") == "verify_actual":
-        actual = chosen
-        predicted_high = data["predicted_high"]
-        prev = data["prev"]
+    result_text, _ = predict_hand(rank, suit, prev, day, hour)
 
-        today_key = datetime.now().strftime("%Y-%m-%d")
-        if today_key not in daily_stats:
-            daily_stats[today_key] = {"total": 0, "correct": 0}
-
-        daily_stats[today_key]["total"] += 1
-
-        if actual == predicted_high:
-            daily_stats[today_key]["correct"] += 1
-            status = "🎉 مبروك التوقع كان صح!\n\nاكتب `تم` للاستمرار"
-        else:
-            status = f"❌ التخمين كان: {predicted_high}\nالفعلي: {actual}\n\nاكتب `تم` للاستمرار"
-
-        train_ai(rank, suit, prev, actual)
-        save_daily_stats()
-
-        await callback.message.edit_text(status)
-        user_temp.pop(user_id, None)
-        return
-
-    result_text, predicted_high = predict_hand(rank, suit, chosen)
-
-    user_temp[user_id] = {
-        "mode": "verify_actual",
-        "predicted_high": predicted_high,
-        "rank": rank,
-        "suit": suit,
-        "prev": chosen
-    }
-
-    await callback.message.edit_text(
-        result_text + "\n\n🔍 ما كانت النتيجة الفعلية؟",
-        reply_markup=hands_kb()
-    )
+    await callback.message.edit_text(result_text)
+    user_temp.pop(user_id, None)
 
 # ================= WEBHOOK =================
 WEBHOOK_PATH = "/webhook"
