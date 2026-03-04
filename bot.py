@@ -183,5 +183,14 @@ async def show_stats(message: Message):
     today_key = get_today_key()
     today = daily_stats.get(today_key, {"total": 0, "correct": 0})
     t_perc = round(today["correct"] / today["total"] * 100, 1) if today["total"] else 0
+    
     all_total = sum(d.get("total", 0) for d in daily_stats.values())
-    all_correct = sum(d.get("correct", 0
+    all_correct = sum(d.get("correct", 0) for d in daily_stats.values())
+    o_perc = round(all_correct / all_total * 100, 1) if all_total else 0
+
+    await message.answer(
+        f"📊 إحصائيات TEXAS AI V8\n\n"
+        f"📅 اليوم:\nالتخمينات: {today['total']}\nالصحيحة: {today['correct']}\nالنسبة: {t_perc}%\n\n"
+        f"📈 الإجمالي:\nالتخمينات: {all_total}\nالصحيحة: {all_correct}\nالنسبة: {o_perc}%\n\n"
+        f"🧠 جولات التدريب: **{get_training_count()}**"
+    )
