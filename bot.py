@@ -70,6 +70,9 @@ async def auto_save():
 def get_training_count():
     return len(AI_MEMORY)
 
+def get_training_percentage():
+    return min(100, int((get_training_count() / 20000) * 100))
+
 def train_ai(rank, suit, prev, curr):
     AI_MEMORY.appendleft({
         "rank": rank, "suit": suit, "prev": prev, "curr": curr,
@@ -162,7 +165,11 @@ async def revoke_subscription(message: Message):
 @dp.message(Command("trainstatus"))
 async def train_status(message: Message):
     if message.from_user.id != ADMIN_ID: return
-    await message.answer(f"📊 عدد الجولات المدربة: **{get_training_count()}**")
+    count = get_training_count()
+    perc = get_training_percentage()
+    await message.answer(f"📊 حالة تدريب البوت\n\n"
+                         f"جولات مدربة: **{count}**\n"
+                         f"نسبة التدريب: **{perc}%**")
 
 @dp.message(Command("stats"))
 async def show_stats(message: Message):
@@ -174,7 +181,10 @@ async def show_stats(message: Message):
     all_correct = sum(d.get("correct", 0) for d in daily_stats.values())
     o_perc = round(all_correct / all_total * 100, 1) if all_total else 0
 
-    await message.answer(f"📊 إحصائيات\nاليوم: {t_perc}%\nالإجمالي: {o_perc}%\nجولات التدريب: {get_training_count()}")
+    await message.answer(f"📊 إحصائيات TEXAS AI V8\n\n"
+                         f"📅 اليوم: {t_perc}%\n"
+                         f"📈 الإجمالي: {o_perc}%\n"
+                         f"🧠 جولات التدريب: {get_training_count()}")
 
 # ================= KEYBOARDS =================
 def ranks_kb():
@@ -239,7 +249,6 @@ async def handle_hand(callback: CallbackQuery):
     suit = data.get("suit")
     if not rank or not suit: return
 
-    # حفظ النتيجة الفعلية
     if data.get("mode") == "verify_actual":
         actual = chosen
         predicted_high = data["predicted_high"]
@@ -253,7 +262,7 @@ async def handle_hand(callback: CallbackQuery):
 
         if actual == predicted_high:
             daily_stats[today_key]["correct"] += 1
-            status = "🎉 مبروك! توقعك كان ممتاز 🔥\n\nاكتب `تم` للاستمرار"
+            status = "🎉 مبروك التوقع كان صح!\n\nاكتب `تم` للاستمرار"
         else:
             status = f"❌ التخمين كان: {predicted_high}\nالفعلي: {actual}\n\nاكتب `تم` للاستمرار"
 
@@ -264,7 +273,6 @@ async def handle_hand(callback: CallbackQuery):
         user_temp.pop(user_id, None)
         return
 
-    # التوقع + طلب النتيجة
     result_text, predicted_high = predict_hand(rank, suit, chosen)
 
     user_temp[user_id] = {
