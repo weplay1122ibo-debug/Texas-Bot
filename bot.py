@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.filters import CommandStart, Command
+from aiogram.filters import CommandStart
 from aiohttp import web
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
@@ -18,7 +18,7 @@ API_TOKEN = os.environ["BOT_TOKEN"]
 DATABASE_URL = os.environ["DATABASE_URL"]
 WEBHOOK_PATH = "/webhook"
 ADMIN_ID = 7717061636
-TRAINER_IDS = [1234567890]  # ضع هنا ID المدربين
+TRAINER_IDS = []  # ضع هنا ID المدرّبين
 
 SAUDI_TZ = ZoneInfo("Asia/Riyadh")
 SPECIAL_MINUTES = [1,5,6,8,9,16,17,21,23,27,28,29,35,36,41,45,47,51,53,55,57,58,59]
@@ -143,7 +143,6 @@ async def predict_hand(side, rank, suit, prev, hands_list):
         confidence=random.randint(30,60)
         return best, confidence
 
-    # Monte Carlo sampling
     probabilities={h:(scores[h]/total) for h in hands_list}
     rand_val=random.random()
     cumulative=0
@@ -195,47 +194,60 @@ async def start(message:Message):
 # ================= CALLBACKS =================
 @dp.callback_query(lambda c:c.data.startswith("rank_"))
 async def choose_rank(callback:CallbackQuery):
-    await callback.answer()
-    user_temp[callback.from_user.id]={"rank":callback.data.split("_")[1]}
-    await callback.message.edit_text("اختر النوع:",reply_markup=suits_kb())
+    try:
+        await callback.answer()
+        user_temp[callback.from_user.id]={"rank":callback.data.split("_")[1]}
+        await callback.message.edit_text("اختر النوع:",reply_markup=suits_kb())
+    except Exception as e:
+        logging.error(f"Error choose_rank: {e}")
 
 @dp.callback_query(lambda c:c.data.startswith("suit_"))
 async def choose_suit(callback:CallbackQuery):
-    await callback.answer()
-    user_temp[callback.from_user.id]["suit"]=callback.data.split("_")[1]
-    await callback.message.edit_text("اختر الضربة السابقة:", reply_markup=prev_hands_kb())
+    try:
+        await callback.answer()
+        user_temp[callback.from_user.id]["suit"]=callback.data.split("_")[1]
+        await callback.message.edit_text("اختر الضربة السابقة:", reply_markup=prev_hands_kb())
+    except Exception as e:
+        logging.error(f"Error choose_suit: {e}")
 
 @dp.callback_query(lambda c:c.data.startswith("prev_"))
 async def handle_prev(callback:CallbackQuery):
-    await callback.answer()
-    user_id = callback.from_user.id
+    try:
+        await callback.answer()
+        user_id = callback.from_user.id
+        if not await check_subscription(user_id):
+            await callback.message.edit_text("❌ الاشتراك منتهي")
+            return
 
-    if not await check_subscription(user_id):
-        await callback.message.edit_text("❌ الاشتراك منتهي")
-        return
+        prev = callback.data.replace("prev_","")
+        data = user_temp.get(user_id)
+        if not data:
+            await callback.message.edit_text("ابدأ من جديد /start")
+            return
 
-    prev = callback.data.replace("prev_","")
-    data = user_temp.get(user_id)
-    if not data:
-        await callback.message.edit_text("ابدأ من جديد /start")
-        return
+        user_temp[user_id]["prev"] = prev
 
-    user_temp[user_id]["prev"] = prev
+        left_pred, left_conf = await predict_hand("left", data["rank"], data["suit"], prev, LEFT_HANDS)
+        right_pred, right_conf = await predict_hand("right", data["rank"], data["suit"], prev, RIGHT_HANDS)
 
-    left_pred, left_conf = await predict_hand("left", data["rank"], data["suit"], prev, LEFT_HANDS)
-    right_pred, right_conf = await predict_hand("right", data["rank"], data["suit"], prev, RIGHT_HANDS)
-
-    await callback.message.edit_text(
-        f"⬅️ يسار: {LEFT_HANDS_LABELS.get(left_pred,left_pred)} ({left_conf}%)\n"
-        f"➡️ يمين: {RIGHT_HANDS_LABELS.get(right_pred,right_pred)} ({right_conf}%)",
-        reply_markup=next_guess_kb()
-    )
+        await callback.message.edit_text(
+            f"⬅️ يسار: {LEFT_HANDS_LABELS.get(left_pred,left_pred)} ({left_conf}%)\n"
+            f"➡️ يمين: {RIGHT_HANDS_LABELS.get(right_pred,right_pred)} ({right_conf}%)",
+            reply_markup=next_guess_kb()
+        )
+    except Exception as e:
+        logging.error(f"Error handle_prev: {e}")
+        await callback.message.answer("حدث خطأ، حاول مرة أخرى /start")
 
 @dp.callback_query(lambda c:c.data=="next_guess")
 async def next_guess(callback:CallbackQuery):
-    await callback.answer()
-    user_temp.pop(callback.from_user.id, None)
-    await callback.message.edit_text("ابدأ التخمين الجديد:", reply_markup=ranks_kb())
+    try:
+        await callback.answer()
+        user_temp.pop(callback.from_user.id, None)
+        await callback.message.edit_text("ابدأ التخمين الجديد:", reply_markup=ranks_kb())
+    except Exception as e:
+        logging.error(f"Error next_guess: {e}")
+        await callback.message.answer("حدث خطأ، حاول مرة أخرى /start")
 
 # ================= WEBHOOK =================
 async def main():
